@@ -87,3 +87,11 @@ test_results/
 *.pth
 *.onnx
 docs/other
+
+# Evaluation artifacts (LoCoMo / LoCoMo-Plus)
+eval_output/
+data/locomo10.json
+data/locomo_plus.json
+data/unified_input_samples*.json
+data/stitched_contexts.json
+data/_*.py
