@@ -152,11 +152,12 @@ def aggregate_lexical(records: List[dict]) -> Dict:
         buckets.setdefault(r.get("category") or "unknown", []).append(r)
 
     def _stats(rows: List[dict]) -> Dict:
-        f1s, sbleus, preds, golds = [], [], [], []
+        f1s, sbleus, sbleus_1, preds, golds = [], [], [], [], []
         for r in rows:
             pred, gold = r.get("prediction") or "", r.get("ground_truth") or ""
             f1s.append(f1_score(pred, gold)[0])
             sbleus.append(sentence_bleu(pred, gold))
+            sbleus_1.append(sentence_bleu(pred, gold, max_n=1))
             preds.append(pred)
             golds.append(gold)
         n = len(rows)
@@ -165,6 +166,8 @@ def aggregate_lexical(records: List[dict]) -> Dict:
             "f1": round(sum(f1s) / n, 4) if n else None,
             "bleu_sentence": round(sum(sbleus) / n, 4) if n else None,
             "bleu_corpus": round(corpus_bleu(preds, golds), 4) if n else None,
+            "bleu_1": round(sum(sbleus_1) / n, 4) if n else None,
+            "bleu_corpus_1": round(corpus_bleu(preds, golds, max_n=1), 4) if n else None,
         }
 
     all_rows = [r for rows in buckets.values() for r in rows]

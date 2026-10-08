@@ -640,7 +640,7 @@ def summarize(judged):
     for cat in cats:
         rows = [r for r in judged if r.get("category") == cat]
         scored = [r for r in rows if "judge_score" in r]
-        lex = lexical["by_category"].get(cat, {"n": 0, "f1": None, "bleu_sentence": None, "bleu_corpus": None})
+        lex = lexical["by_category"].get(cat, {"n": 0, "f1": None, "bleu_sentence": None, "bleu_corpus": None, "bleu_1": None, "bleu_corpus_1": None})
         by_cat[cat] = {
             "n_predictions": len(rows),
             "n_judged": len(scored),
@@ -654,6 +654,8 @@ def summarize(judged):
             "f1": lex["f1"],
             "bleu_sentence": lex["bleu_sentence"],
             "bleu_corpus": lex["bleu_corpus"],
+            "bleu_1": lex.get("bleu_1"),
+            "bleu_corpus_1": lex.get("bleu_corpus_1"),
         }
 
     scored_all = [r for r in judged if "judge_score" in r]
@@ -685,13 +687,15 @@ def print_summary(summary):
     print(f"  F1                          : {o.get('f1')}")
     print(f"  BLEU (sentence, smoothed)   : {o.get('bleu_sentence')}")
     print(f"  BLEU (corpus)               : {o.get('bleu_corpus')}")
+    print(f"  BLEU-1 (sentence, paper)    : {o.get('bleu_1')}")
+    print(f"  BLEU-1 (corpus)             : {o.get('bleu_corpus_1')}")
     print("-" * 78)
-    header = f"  {'category':<12}{'n':>5}{'judg':>6}{'judAcc':>9}{'judAvg':>8}{'nGold':>7}{'F1':>8}{'BLEU':>8}"
+    header = f"  {'category':<12}{'n':>5}{'judg':>6}{'judAcc':>9}{'judAvg':>8}{'nGold':>7}{'F1':>8}{'BLEU1':>8}"
     print(header)
     for cat, s in summary["by_category"].items():
         print(f"  {cat:<12}{s['n_predictions']:>5}{s['n_judged']:>6}"
               f"{str(s['judge_accuracy_strict']):>9}{str(s['judge_score_avg']):>8}"
-              f"{s['n_gold']:>7}{str(s['f1']):>8}{str(s['bleu_sentence']):>8}")
+              f"{s['n_gold']:>7}{str(s['f1']):>8}{str(s['bleu_1']):>8}")
     print("=" * 78)
 
 
@@ -710,6 +714,8 @@ def main():
     parser.add_argument("--cognitive-limit", type=int, default=None,
                         help="Evaluate only the first N LoCoMo-Plus samples (default all 401)")
     parser.add_argument("--skip-cognitive", action="store_true")
+    parser.add_argument("--skip-locomo", action="store_true",
+                        help="Skip original LoCoMo 5-category QA (run Cognitive only)")
     parser.add_argument("--skip-judge", action="store_true")
     parser.add_argument("--judge-model", default="", help="Default: same LLM_MODEL as the system")
     parser.add_argument("--judge-concurrency", type=int, default=8)
@@ -779,7 +785,8 @@ def main():
         if args.resume:
             logger.info("Resuming: %d predictions already present", len(done_ids))
 
-        run_locomo(args, locomo_data, out_dir, done_ids, predictions_path)
+        if not args.skip_locomo:
+            run_locomo(args, locomo_data, out_dir, done_ids, predictions_path)
         run_cognitive(args, plus_data, locomo_data, out_dir, done_ids, predictions_path)
 
         predictions = read_jsonl(predictions_path)
