@@ -31,6 +31,9 @@ python eval/run_simplemem_eval.py --judge-model gpt-4o-mini --judge-concurrency 
 
 # predictions + lexical metrics only
 python eval/run_simplemem_eval.py --skip-judge
+
+# LoCoMo-Plus (Cognitive) only, 8 samples in parallel, resumable
+python eval/run_simplemem_eval.py --skip-locomo --cognitive-concurrency 8 --resume
 """
 import argparse
 import gc
@@ -443,77 +446,128 @@ def run_locomo(args, locomo_data, out_dir, done_ids, predictions_path):
         release_system(system)
 
 
+def run_one_cognitive_sample(pi, args, plus_data, locomo_data, out_dir, SystemCls):
+    """
+    Build an independent SimpleMem memory store for ONE cognitive sample and
+    answer its trigger turn. Every call owns its own system / LanceDB directory,
+    so it is safe to invoke concurrently from a ThreadPoolExecutor.
+
+    Returns the prediction record, or None when dialogue stitching fails
+    (caller counts it as failed). Never raises: build/ask errors are captured
+    into the record's "error" field so one bad sample cannot kill the batch.
+    """
+    sid = f"cognitive-{pi}"
+    plus_item = plus_data[pi]
+    # Official unified_input.py selects conversations deterministically by modulo.
+    locomo_item = locomo_data[pi % len(locomo_data)]
+    ci = pi % len(locomo_data)
+    t0 = time.time()
+    try:
+        turns_in, q_speaker, q_text, respond_as, evidence = build_cognitive_plan(plus_item, locomo_item)
+    except Exception:
+        log.exception("[Cognitive] %s: stitching plan failed", sid)
+        return None
+
+    db_path = out_dir / "db" / f"cognitive_{pi}"
+    system = build_system(SystemCls, db_path, clear=True)
+    error = ""
+    prediction = ""
+    try:
+        for speaker, text, dt in turns_in:
+            system.add_dialogue(speaker, text, iso(dt))
+        system.finalize()
+        question = (
+            f'Continue the conversation naturally. {q_speaker} says: "{q_text}" '
+            f"Reply as {respond_as} in 1-3 sentences, showing awareness of relevant prior context."
+        )
+        prediction = system.ask(question)
+    except Exception as exc:
+        error = str(exc)
+        prediction = f"[ERROR] {exc}"
+        log.exception("[Cognitive] build/ask failed | %s", sid)
+    finally:
+        release_system(system)
+        if not args.keep_cognitive_db:
+            force_rmtree(db_path)
+
+    return {
+        "sample_id": sid,
+        "source": "cognitive",
+        "conversation_id": ci,
+        "question_input": plus_item.get("trigger_query", ""),
+        "evidence": evidence,
+        "category": COGNITIVE,
+        "ground_truth": "",
+        "prediction": prediction,
+        "model": args.run_model,
+        "time_gap": plus_item.get("time_gap", ""),
+        "elapsed_sec": round(time.time() - t0, 2),
+        "error": error,
+    }
+
+
 def run_cognitive(args, plus_data, locomo_data, out_dir, done_ids, predictions_path):
     if args.skip_cognitive:
         log.info("[Cognitive] skipped (--skip-cognitive)")
         return
     limit = len(plus_data) if args.cognitive_limit is None else min(args.cognitive_limit, len(plus_data))
-    log.info("[Cognitive] evaluating %d samples (independent memory store each)", limit)
+    # Resolve the pending list up front (main thread) so worker threads never
+    # mutate the shared resume set / output file.
+    pending = [pi for pi in range(limit)
+               if not (args.resume and f"cognitive-{pi}" in done_ids)]
+    workers = max(1, args.cognitive_concurrency)
+    log.info("[Cognitive] evaluating %d samples (%d pending, %d concurrent workers, "
+             "independent memory store each)",
+             limit, len(pending), workers)
     SystemCls = load_simplemem_system_cls()
     n_written, n_failed = 0, 0
     t_stage = time.time()
-    for pi in range(limit):
-        sid = f"cognitive-{pi}"
-        if args.resume and sid in done_ids:
-            continue
-        plus_item = plus_data[pi]
-        # Official unified_input.py selects conversations deterministically by modulo.
-        locomo_item = locomo_data[pi % len(locomo_data)]
-        ci = pi % len(locomo_data)
-        t0 = time.time()
-        try:
-            turns_in, q_speaker, q_text, respond_as, evidence = build_cognitive_plan(plus_item, locomo_item)
-        except Exception:
-            n_failed += 1
-            log.exception("[Cognitive] %s: stitching plan failed", sid)
-            continue
 
-        db_path = out_dir / "db" / f"cognitive_{pi}"
-        system = build_system(SystemCls, db_path, clear=True)
-        error = ""
-        prediction = ""
-        try:
-            for speaker, text, dt in turns_in:
-                system.add_dialogue(speaker, text, iso(dt))
-            system.finalize()
-            question = (
-                f'Continue the conversation naturally. {q_speaker} says: "{q_text}" '
-                f"Reply as {respond_as} in 1-3 sentences, showing awareness of relevant prior context."
-            )
-            try:
-                prediction = system.ask(question)
-            except Exception as exc:
-                error = str(exc)
-                prediction = f"[ERROR] {exc}"
-                log.exception("[Cognitive] ask failed | %s", sid)
-        finally:
-            release_system(system)
-            if not args.keep_cognitive_db:
-                force_rmtree(db_path)
-
-        record = {
-            "sample_id": sid,
-            "source": "cognitive",
-            "conversation_id": ci,
-            "question_input": plus_item.get("trigger_query", ""),
-            "evidence": evidence,
-            "category": COGNITIVE,
-            "ground_truth": "",
-            "prediction": prediction,
-            "model": args.run_model,
-            "time_gap": plus_item.get("time_gap", ""),
-            "elapsed_sec": round(time.time() - t0, 2),
-            "error": error,
-        }
-        append_jsonl(predictions_path, [record])
-        done_ids.add(sid)
-        n_written += 1
-        if error:
+    def _consume(record):
+        # Single-writer: only the main thread calls this as futures complete,
+        # so JSONL appends / done_ids updates need no lock.
+        nonlocal n_written, n_failed
+        if record is None:
             n_failed += 1
-        log.debug("[Cognitive] %s done in %.1fs", sid, record["elapsed_sec"])
-        if (pi + 1) % 10 == 0:
-            log.info("[Cognitive] %d/%d processed (%d written, %d errors, %.0fs elapsed)",
-                     pi + 1, limit, n_written, n_failed, time.time() - t_stage)
+        else:
+            append_jsonl(predictions_path, [record])
+            done_ids.add(record["sample_id"])
+            n_written += 1
+            if record.get("error"):
+                n_failed += 1
+            log.debug("[Cognitive] %s done in %.1fs",
+                      record["sample_id"], record["elapsed_sec"])
+        processed = n_written + n_failed
+        if processed % 10 == 0 or processed == len(pending):
+            elapsed = time.time() - t_stage
+            rate = processed / elapsed * 60 if elapsed > 0 else 0.0
+            log.info("[Cognitive] %d/%d processed (%d written, %d errors, %.0fs elapsed, "
+                     "%.2f samples/min)",
+                     processed, len(pending), n_written, n_failed, elapsed, rate)
+
+    if workers == 1:
+        # Keep the original deterministic serial path for --cognitive-concurrency 1.
+        for pi in pending:
+            _consume(run_one_cognitive_sample(
+                pi, args, plus_data, locomo_data, out_dir, SystemCls))
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = [pool.submit(run_one_cognitive_sample, pi, args,
+                               plus_data, locomo_data, out_dir, SystemCls)
+                   for pi in pending]
+        try:
+            for fut in as_completed(futures):
+                _consume(fut.result())
+        except KeyboardInterrupt:
+            # Persisted records stay valid; --resume skips them on restart.
+            log.warning("[Cognitive] interrupted after %d persisted samples; "
+                        "cancelling queued work (in-flight requests are left to finish).",
+                        n_written)
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+
     log.info("[Cognitive] stage finished: %d written, %d failed, %.1fs total",
              n_written, n_failed, time.time() - t_stage)
 
@@ -552,12 +606,16 @@ def run_judge(args, predictions, judged_path, done_judged):
     from openai import OpenAI
     from simplemem.core.settings import settings
 
-    api_key = settings.OPENAI_API_KEY
-    base_url = settings.OPENAI_BASE_URL
+    # Precedence: CLI --judge-model > config JUDGE_* > config OPENAI_*/LLM_MODEL
+    api_key = settings.JUDGE_API_KEY or settings.OPENAI_API_KEY
+    base_url = settings.JUDGE_BASE_URL or settings.OPENAI_BASE_URL
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not configured (root config.py or environment variable).")
     client = OpenAI(api_key=api_key, base_url=base_url)
-    model = args.judge_model or settings.LLM_MODEL
+    model = args.judge_model or settings.JUDGE_MODEL or settings.LLM_MODEL
+    # Reasoning models (e.g. DeepSeek-R1) spend completion tokens on the chain
+    # of thought; 512 would often leave the final content empty.
+    max_tokens = 2048 if "r1" in model.lower() else 512
 
     pending = [r for r in predictions if r["sample_id"] not in done_judged]
     log.info("[Judge] %d samples to judge with %s (concurrency=%d)",
@@ -584,9 +642,12 @@ def run_judge(args, predictions, judged_path, done_judged):
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
-                    max_tokens=512,
+                    max_tokens=max_tokens,
                 )
                 raw = (resp.choices[0].message.content or "").strip()
+                if not raw:
+                    raise RuntimeError(
+                        "judge returned empty content (reasoning token budget exhausted?)")
                 break
             except Exception as exc:
                 if attempt == 2:
@@ -713,6 +774,10 @@ def main():
                         help="Per conversation, sample at most N QA per category (0 = all)")
     parser.add_argument("--cognitive-limit", type=int, default=None,
                         help="Evaluate only the first N LoCoMo-Plus samples (default all 401)")
+    parser.add_argument("--cognitive-concurrency", type=int, default=4,
+                        help="Number of LoCoMo-Plus samples processed concurrently; each "
+                             "builds an independent memory store. Lower it (e.g. 1-2) when "
+                             "the LLM/embedding API rate-limits; 1 restores serial mode")
     parser.add_argument("--skip-cognitive", action="store_true")
     parser.add_argument("--skip-locomo", action="store_true",
                         help="Skip original LoCoMo 5-category QA (run Cognitive only)")

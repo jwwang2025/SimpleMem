@@ -151,21 +151,15 @@ class LanceDBVectorStoreBackend:
             return
 
         try:
-            if self._is_cloud_storage:
-                self.table.create_fts_index(
-                    "lossless_restatement",
-                    use_tantivy=False,
-                    replace=True,
-                )
-                print("FTS index created (native mode for cloud storage)")
-            else:
-                self.table.create_fts_index(
-                    "lossless_restatement",
-                    use_tantivy=True,
-                    tokenizer_name="en_stem",
-                    replace=True,
-                )
-                print("FTS index created (Tantivy mode)")
+            # LanceDB >= 0.20 removed the Tantivy backend; native FTS is the only
+            # option. Its default English tokenizer lower-cases, stems and drops
+            # stop words, matching the previous "en_stem" Tantivy tokenizer.
+            self.table.create_fts_index(
+                "lossless_restatement",
+                use_tantivy=False,
+                replace=True,
+            )
+            print("FTS index created (native mode)")
             self._fts_initialized = True
         except Exception as error:
             print(f"FTS index creation skipped: {error}")
