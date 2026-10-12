@@ -60,8 +60,10 @@ class LLMClient:
             kwargs["response_format"] = response_format
 
         # Enable thinking mode if configured (for Qwen and compatible models only)
-        # Only add enable_thinking parameter for Qwen API (identified by base_url)
-        is_qwen_api = self.base_url and "dashscope.aliyuncs.com" in self.base_url
+        # Only add enable_thinking parameter for Qwen-compatible APIs (identified by base_url)
+        is_qwen_api = self.base_url and (
+            "dashscope.aliyuncs.com" in self.base_url or "siliconflow.cn" in self.base_url
+        )
         
         if is_qwen_api:
             # Qwen API requires explicit enable_thinking parameter

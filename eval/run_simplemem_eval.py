@@ -638,11 +638,20 @@ def run_judge(args, predictions, judged_path, done_judged):
         raw = ""
         for attempt in range(3):
             try:
+                # Qwen3 on SiliconFlow/dashscope enables thinking by default; with a
+                # small max_tokens the reasoning tokens exhaust the budget and leave
+                # content empty -> every sample would be judged wrong. Disable it.
+                judge_extra_body = None
+                if base_url and (
+                    "siliconflow.cn" in base_url or "dashscope.aliyuncs.com" in base_url
+                ):
+                    judge_extra_body = {"enable_thinking": False}
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0,
                     max_tokens=max_tokens,
+                    extra_body=judge_extra_body,
                 )
                 raw = (resp.choices[0].message.content or "").strip()
                 if not raw:
