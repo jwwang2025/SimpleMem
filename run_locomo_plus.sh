@@ -6,22 +6,21 @@
 #
 # Zero-429 posture (SiliconFlow free tier: 1000 RPM / 50K TPM, account level):
 #   - PRIMARY defense: client-side token-bucket throttle (RateLimiter in
-#     simplemem/core/utils/llm_client.py) caps OFFERED load at 300 RPM / 30K TPM
-#     (= 30% / 60% of the caps) across ALL LLM paths (memory builder, answer
-#     generator, judge) via a process-wide singleton. The sliding window never
-#     sees an excess, so no request is ever rejected. Wall clock ~12h
-#     (20.2M tokens / 30K TPM floor ~11h); correctness first.
-#   - cognitive-concurrency 20 is now just parallelism: the throttle, not the
-#     worker count, paces the offered load (48 workers without throttle were
-#     measured offering 61K TPM = 123% of the cap -> 99% rejected).
-#   - SAFETY NET: up to 10 attempts per call with jittered exponential backoff
-#     (LLM_* / JUDGE_* settings in simplemem/core/settings.py).
-#   - ACCOUNTING: every real API attempt is counted; summary.json reports
-#     n_llm_calls / n_429 / rate_limiter. --strict exits with code 1 if ANY
-#     sample errors OR any 429 occurs, so a throttled or half-failed run can
-#     never be mistaken for a clean result.
-#   - Fresh out-dir (locomo_plus_v3), no --resume: previous runs' outputs stay
-#     untouched for comparison, and no degraded record can leak into metrics.
+#     simplemem/core/utils/llm_client.py) caps OFFERED load at 300 RPM / 24K TPM
+#     (= 30% / 48% of the caps) across ALL LLM paths (memory builder, answer
+#     generator, judge) via a process-wide singleton. Estimates are calibrated
+#     against real response usage (EWMA) because Qwen3's actual output ran
+#     ~1.5x the static estimate - without calibration the true offered TPM
+#     exceeded the cap and drew steady-state 429s (observed 00:04-00:25).
+#   - cognitive-concurrency 20 is just parallelism; the throttle paces the
+#     offered load (48 workers without throttle offered 61K TPM = 123% of cap).
+#   - SAFETY NET: up to 10 attempts per call with jittered exponential backoff.
+#   - ACCOUNTING: summary.json reports n_llm_calls / n_429 / rate_limiter;
+#     --strict exits 1 on ANY sample error OR ANY 429.
+#   - v3 restart (00:30): first 2h ran with the un-calibrated 30K budget and
+#     drew 252 x 429 (all retried away, no hard failures, 38 samples done and
+#     kept). This relaunch resumes those 38 samples via --resume; the previous
+#     run log is kept as locomo_plus_v3_run.log.
 cd /home/apulis-dev/code/SimpleMem
 source /home/apulis-dev/code/envs/simplemem/bin/activate || exit 1
 export TOKENIZERS_PARALLELISM=false
@@ -29,9 +28,9 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 
 mkdir -p eval_output
 setsid nohup python eval/run_simplemem_eval.py \
-  --skip-locomo \
+  --skip-locomo --resume \
   --cognitive-concurrency 20 \
   --judge-model Qwen/Qwen3-8B --judge-concurrency 8 --run-model Qwen/Qwen3-8B \
   --out-dir eval_output/locomo_plus_v3 --run-tag locomo_plus_v3 --strict \
-  > /home/apulis-dev/code/SimpleMem/eval_output/locomo_plus_v3_run.log 2>&1 < /dev/null &
-echo "launched LoCoMo-Plus (Cognitive) eval, pid $!"
+  > /home/apulis-dev/code/SimpleMem/eval_output/locomo_plus_v3_run2.log 2>&1 < /dev/null &
+echo "launched LoCoMo-Plus (Cognitive) eval (resume), pid $!"
