@@ -11,6 +11,7 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 mkdir -p eval_output
 setsid nohup python eval/run_simplemem_eval.py \
   --skip-locomo \
+  --cognitive-concurrency 48 \
   --judge-model Qwen/Qwen3-8B --judge-concurrency 8 --run-model Qwen/Qwen3-8B \
   --out-dir eval_output/locomo_plus --run-tag locomo_plus --resume \
   > /home/apulis-dev/code/SimpleMem/eval_output/locomo_plus_run.log 2>&1 < /dev/null &
