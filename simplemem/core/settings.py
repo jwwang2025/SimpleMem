@@ -56,15 +56,18 @@ _DEFAULTS = {
     # Retries alone cannot guarantee clean results: during the 2026-10-12 run
     # 99.1% of chat requests were rejected and 93% of extraction windows died
     # anyway. The robust fix is to never EXCEED the limit in the first place:
-    # offer at most these budgets - defaults are 30% of the 1000 RPM cap and
-    # 60% of the 50K TPM cap - leaving headroom for bursts, in-flight calls
-    # and the judge phase sharing the same account. With ~40% headroom the
-    # sliding window never sees an excess, so no request is ever rejected.
-    # Cost: the full run needs ~20.2M tokens, so wall clock >= ~11h at 30K
-    # TPM. Correctness first; raise LLM_TPM_BUDGET only if speed is critical.
+    # offer at most these budgets - 24K TPM = 48% of the 50K cap (measured safe:
+    # the judge phase ran ~47K TPM with zero 429) - leaving headroom for
+    # bursts, in-flight calls and the judge phase sharing the same account.
+    # NOTE: the static token estimate under-counted Qwen3's real output ~1.5x
+    # in the first v3 hours (true offered TPM hit ~70K despite the 30K nominal
+    # budget -> 252 x 429). chat_completion now calibrates estimates against
+    # real response usage (EWMA), and the budget was lowered to 24K so even a
+    # 1.5x estimation error stays under the cap. Cost: the full run needs
+    # ~20.2M tokens -> wall clock ~12-16h. Correctness first.
     "ENABLE_RATE_LIMITER": True,      # master switch (False = pass-through)
     "LLM_RPM_BUDGET": 300,            # offered requests/min (server cap 1000)
-    "LLM_TPM_BUDGET": 30000,          # offered tokens/min (server cap 50000)
+    "LLM_TPM_BUDGET": 24000,          # offered tokens/min (server cap 50000)
     "LLM_RATE_LIMIT_BURST_SECONDS": 2.0,  # bucket capacity window; smaller = smoother
 }
 

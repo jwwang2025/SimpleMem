@@ -115,6 +115,12 @@ _global_limiter: Optional["RateLimiter"] = None
 _global_limiter_lock = threading.Lock()
 _call_stats = {"calls": 0, "rejected_429": 0}
 _call_stats_lock = threading.Lock()
+# EWMA of actual/estimated tokens per call, calibrated from real response
+# usage: the static estimate under-counted Qwen3's output ~1.5x in the first
+# v3 hours, which silently doubled the offered TPM. Starts at 1.0 and
+# converges within a few hundred calls.
+_est_ratio_lock = threading.Lock()
+_est_ratio = 1.0
 
 
 def get_rate_limiter() -> "RateLimiter":
@@ -159,6 +165,27 @@ def note_llm_call(rejected_429: bool = False):
 def get_llm_stats() -> Dict[str, int]:
     with _call_stats_lock:
         return dict(_call_stats)
+
+
+def _est_ratio_snapshot() -> float:
+    with _est_ratio_lock:
+        return _est_ratio
+
+
+def _note_actual_usage(response, est: float):
+    """Calibrate the estimate against real token usage (EWMA, alpha=0.1).
+    Closes the loop between what we THROTTLE on and what the server METERS:
+    without this, a systematically under-counted output silently doubles the
+    offered TPM (exactly what produced 252 x 429 in the first v3 hours)."""
+    global _est_ratio
+    usage = getattr(response, "usage", None)
+    if usage is None or est <= 0:
+        return
+    actual = float(getattr(usage, "total_tokens", 0) or 0)
+    if actual <= 0:
+        return
+    with _est_ratio_lock:
+        _est_ratio = 0.9 * _est_ratio + 0.1 * (actual / est)
 
 
 class LLMClient:
@@ -248,7 +275,12 @@ class LLMClient:
         cap = float(getattr(config, "LLM_RETRY_MAX_DELAY", 60.0))
         jitter = float(getattr(config, "LLM_RETRY_JITTER", 1.0))
         limiter = get_rate_limiter()
-        est_tokens = estimate_call_tokens(messages, expected_output_tokens=1000.0)
+        # Output margin covers the extraction JSON; the static estimate is then
+        # calibrated against REAL usage via the EWMA ratio below (Qwen3's actual
+        # output ran ~1.5x the static estimate, which had pushed the true
+        # offered TPM over the cap despite the nominal budget).
+        est_tokens = estimate_call_tokens(messages, expected_output_tokens=1600.0)
+        est_tokens *= _est_ratio_snapshot()
         last_exception = None
         for attempt in range(max_retries):
             try:
@@ -264,6 +296,7 @@ class LLMClient:
                 else:
                     response = self.client.chat.completions.create(**kwargs)
                     note_llm_call()
+                    _note_actual_usage(response, est_tokens)
                     return response.choices[0].message.content
                 
                 # kwargs["stream"] = True
