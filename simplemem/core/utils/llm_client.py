@@ -2,9 +2,39 @@
 LLM Client - Handles all LLM interactions
 """
 import json
+import random
+import time
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 from simplemem.core.settings import settings as config
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    """True for HTTP 429 / SiliconFlow rate-limit rejections (codes 50601/50602)."""
+    if getattr(exc, "status_code", None) == 429:
+        return True
+    text = str(exc).lower()
+    return ("429" in text or "rate limit" in text or "too many requests" in text
+            or "50601" in text or "50602" in text)
+
+
+def compute_backoff(attempt: int, base: float, cap: float, jitter: float,
+                    rate_limit: bool = False) -> float:
+    """Exponential backoff with optional jitter.
+
+    Full jitter (jitter=1.0 -> sleep ~ U(0, delay)) decorrelates concurrent
+    workers so a rate-limit window is not hammered by a synchronized retry
+    wave - the direct cause of the 2026-10-12 retry storm (3,200 attempts/min
+    against a 1000 RPM cap). Non-rate-limit errors (timeouts, resets) use a
+    shorter ladder because waiting longer rarely helps them.
+    """
+    ladder_cap = cap if rate_limit else min(cap, 8.0)
+    delay = min(ladder_cap, base * (2 ** attempt))
+    if jitter >= 1.0:
+        delay = random.uniform(0.0, delay)
+    elif jitter > 0:
+        delay = delay * (1.0 - jitter * random.random())
+    return max(0.0, delay)
 
 
 class LLMClient:
@@ -35,9 +65,14 @@ class LLMClient:
             print(f"Deep thinking mode enabled")
 
         # self.client = OpenAI(**client_kwargs)
+        # LLM_SDK_MAX_RETRIES=0 disables the SDK's own internal retries: they use
+        # a short fixed backoff and fire IN ADDITION to the loop below, which
+        # multiplied request volume during 429 storms. All backoff now happens
+        # exactly once, in chat_completion().
         self.client = OpenAI(
             base_url=self.base_url,
             api_key=self.api_key,
+            max_retries=int(getattr(config, "LLM_SDK_MAX_RETRIES", 0)),
         )
 
     def chat_completion(
@@ -45,11 +80,18 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.2,
         response_format: Optional[Dict[str, str]] = None,
-        max_retries: int = 3
+        max_retries: Optional[int] = None,
     ) -> str:
         """
-        Standard chat completion with optional thinking mode and retry mechanism
+        Standard chat completion with optional thinking mode and retry mechanism.
+
+        Retries are config-driven (LLM_MAX_RETRIES / LLM_RETRY_BASE_DELAY /
+        LLM_RETRY_MAX_DELAY / LLM_RETRY_JITTER): exponential backoff with full
+        jitter, rate-limit aware. Default budget is 10 attempts - a 429 storm
+        can easily outlast the old 3 attempts x {1s, 2s, 4s}.
         """
+        if max_retries is None:
+            max_retries = max(1, int(getattr(config, "LLM_MAX_RETRIES", 10)))
         kwargs = {
             "model": self.model,
             "messages": messages,
@@ -77,7 +119,10 @@ class LLMClient:
                 kwargs["extra_body"] = {"enable_thinking": False}
         # For OpenAI and other APIs, don't add extra_body parameters
 
-        # Retry mechanism
+        # Retry mechanism: exponential backoff + full jitter, rate-limit aware
+        base = float(getattr(config, "LLM_RETRY_BASE_DELAY", 1.0))
+        cap = float(getattr(config, "LLM_RETRY_MAX_DELAY", 60.0))
+        jitter = float(getattr(config, "LLM_RETRY_JITTER", 1.0))
         last_exception = None
         for attempt in range(max_retries):
             try:
@@ -96,10 +141,12 @@ class LLMClient:
                 # print(e)
                 last_exception = e
                 if attempt < max_retries - 1:
-                    import time
-                    wait_time = (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                    print(f"LLM API call failed (attempt {attempt + 1}/{max_retries}): {e}")
-                    print(f"Retrying in {wait_time} seconds...")
+                    rate_limited = is_rate_limit_error(e)
+                    wait_time = compute_backoff(attempt, base, cap, jitter,
+                                                rate_limit=rate_limited)
+                    print(f"LLM API call failed (attempt {attempt + 1}/{max_retries}"
+                          f"{', rate-limited' if rate_limited else ''}): {e}")
+                    print(f"Retrying in {wait_time:.1f} seconds...")
                     time.sleep(wait_time)
                 else:
                     print(f"LLM API call failed after {max_retries} attempts: {e}")

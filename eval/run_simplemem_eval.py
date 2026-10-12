@@ -399,15 +399,54 @@ def run_locomo(args, locomo_data, out_dir, done_ids, predictions_path):
         log.info("[LoCoMo] conv %d: building memory (%s / %s) -> %s",
                  ci, conv.get("speaker_a"), conv.get("speaker_b"), db_path)
         t_build = time.time()
-        system = build_system(SystemCls, db_path, clear=True)
-        gen = build_locomo_turns(conv)
-        n_turns = 0
-        for speaker, text, dt in gen:
-            system.add_dialogue(speaker, text, iso(dt))
-            n_turns += 1
-        system.finalize()
-        log.info("[LoCoMo] conv %d: memory built in %.1fs from %d turns",
-                 ci, time.time() - t_build, n_turns)
+        system = None
+        build_error = ""
+        try:
+            system = build_system(SystemCls, db_path, clear=True)
+            gen = build_locomo_turns(conv)
+            n_turns = 0
+            for speaker, text, dt in gen:
+                system.add_dialogue(speaker, text, iso(dt))
+                n_turns += 1
+            system.finalize()
+            failed_windows = getattr(system.memory_builder, "failed_windows", 0)
+            if failed_windows:
+                raise RuntimeError(
+                    f"memory extraction failed for {failed_windows} window(s)")
+            log.info("[LoCoMo] conv %d: memory built in %.1fs from %d turns",
+                     ci, time.time() - t_build, n_turns)
+        except Exception as exc:
+            build_error = str(exc)
+            log.exception("[LoCoMo] conv %d: memory build failed", ci)
+
+        if build_error:
+            # Every QA of this conversation is invalid: record errors so they
+            # are excluded from metrics instead of answered from partial memory.
+            if system is not None:
+                release_system(system)
+            err_rows = []
+            for qi, qa in qa_rows:
+                sid = f"locomo-{ci}-qa-{qi}"
+                if sid in done_ids:
+                    continue
+                err_rows.append({
+                    "sample_id": sid,
+                    "source": "locomo",
+                    "conversation_id": ci,
+                    "question_input": qa.get("question", ""),
+                    "evidence": locomo_evidence_text(conv, qa.get("evidence") or []),
+                    "category": LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}'),
+                    "ground_truth": "" if qa.get("answer") is None else str(qa["answer"]),
+                    "prediction": f"[ERROR] {build_error}",
+                    "model": args.run_model,
+                    "elapsed_sec": 0.0,
+                    "error": build_error,
+                })
+                done_ids.add(sid)
+            append_jsonl(predictions_path, err_rows)
+            log.error("[LoCoMo] conv %d: wrote %d error records (memory build failed)",
+                      ci, len(err_rows))
+            continue
 
         new_rows = []
         t_ask = time.time()
@@ -476,6 +515,14 @@ def run_one_cognitive_sample(pi, args, plus_data, locomo_data, out_dir, SystemCl
         for speaker, text, dt in turns_in:
             system.add_dialogue(speaker, text, iso(dt))
         system.finalize()
+        # An incomplete memory store makes the answer meaningless: flag the
+        # sample as an error (excluded from metrics) instead of silently
+        # answering from partial memory.
+        failed_windows = getattr(system.memory_builder, "failed_windows", 0)
+        if failed_windows:
+            raise RuntimeError(
+                f"memory extraction failed for {failed_windows} window(s) after "
+                f"all retries; sample flagged as error and excluded from metrics")
         question = (
             f'Continue the conversation naturally. {q_speaker} says: "{q_text}" '
             f"Reply as {respond_as} in 1-3 sentences, showing awareness of relevant prior context."
@@ -605,24 +652,42 @@ def parse_judge_response(raw: str):
 def run_judge(args, predictions, judged_path, done_judged):
     from openai import OpenAI
     from simplemem.core.settings import settings
+    from simplemem.core.utils.llm_client import compute_backoff, is_rate_limit_error
 
     # Precedence: CLI --judge-model > config JUDGE_* > config OPENAI_*/LLM_MODEL
     api_key = settings.JUDGE_API_KEY or settings.OPENAI_API_KEY
     base_url = settings.JUDGE_BASE_URL or settings.OPENAI_BASE_URL
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not configured (root config.py or environment variable).")
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    # max_retries=0: the SDK's short fixed backoff multiplied request volume
+    # during 429 storms; judge_one below owns the retry policy (jittered
+    # exponential backoff, config-driven budget).
+    client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
     model = args.judge_model or settings.JUDGE_MODEL or settings.LLM_MODEL
     # Reasoning models (e.g. DeepSeek-R1) spend completion tokens on the chain
     # of thought; 512 would often leave the final content empty.
     max_tokens = 2048 if "r1" in model.lower() else 512
 
     pending = [r for r in predictions if r["sample_id"] not in done_judged]
+    # Records flagged with prediction-stage errors (LLM outage, incomplete
+    # memory build, ...) are NOT judged: they are excluded from all metrics
+    # downstream instead of being silently scored as wrong answers.
+    n_err_pred = sum(1 for r in predictions if r.get("error"))
+    if n_err_pred:
+        log.info("[Judge] skipping %d error-flagged predictions (excluded from metrics)",
+                 n_err_pred)
+    pending = [r for r in predictions
+               if not r.get("error") and r["sample_id"] not in done_judged]
     log.info("[Judge] %d samples to judge with %s (concurrency=%d)",
              len(pending), model, args.judge_concurrency)
     if not pending:
         return read_jsonl(judged_path)
     judge_log = logging.getLogger("eval.judge")
+
+    judge_max_retries = max(1, int(getattr(settings, "JUDGE_MAX_RETRIES", 10)))
+    judge_base = float(getattr(settings, "JUDGE_RETRY_BASE_DELAY", 2.0))
+    judge_cap = float(getattr(settings, "LLM_RETRY_MAX_DELAY", 60.0))
+    judge_jitter = float(getattr(settings, "LLM_RETRY_JITTER", 1.0))
 
     def judge_one(record):
         cat = record.get("category") or "unknown"
@@ -636,7 +701,7 @@ def run_judge(args, predictions, judged_path, done_judged):
             evidence=str(record.get("evidence") or ""),
         )
         raw = ""
-        for attempt in range(3):
+        for attempt in range(judge_max_retries):
             try:
                 # Qwen3 on SiliconFlow/dashscope enables thinking by default; with a
                 # small max_tokens the reasoning tokens exhaust the budget and leave
@@ -659,14 +724,23 @@ def run_judge(args, predictions, judged_path, done_judged):
                         "judge returned empty content (reasoning token budget exhausted?)")
                 break
             except Exception as exc:
-                if attempt == 2:
-                    judge_log.error("judge api failed after 3 attempts | %s | %s",
-                                    record.get("sample_id"), exc)
-                    raw = json.dumps({"label": "wrong", "reason": f"judge api error: {exc}"})
+                if attempt < judge_max_retries - 1:
+                    wait = compute_backoff(attempt, judge_base, judge_cap, judge_jitter,
+                                           rate_limit=is_rate_limit_error(exc))
+                    judge_log.warning(
+                        "judge api attempt %d/%d failed | %s | %s; retrying in %.1fs",
+                        attempt + 1, judge_max_retries, record.get("sample_id"), exc, wait)
+                    time.sleep(wait)
                 else:
-                    judge_log.warning("judge api attempt %d failed | %s | %s; retrying",
-                                      attempt + 1, record.get("sample_id"), exc)
-                    time.sleep(2 ** attempt)
+                    # A judge API failure is NOT evidence that the answer is
+                    # wrong. Mark the record with judge_error so it is excluded
+                    # from metrics - fabricating "wrong" here is exactly how a
+                    # throttled run silently destroys its own accuracy.
+                    judge_log.error("judge api failed after %d attempts | %s | %s",
+                                    judge_max_retries, record.get("sample_id"), exc)
+                    out = dict(record)
+                    out["judge_error"] = f"judge api error: {exc}"
+                    return out, "error", f"judge api error: {exc}", 0.0
         label, reason = parse_judge_response(raw)
         score = {"correct": 1.0, "partial": 0.5}.get(label.lower(), 0.0)
         out = dict(record)
@@ -704,16 +778,23 @@ def run_judge(args, predictions, judged_path, done_judged):
 # ---------------------------------------------------------------------------
 
 def summarize(judged):
-    lexical = aggregate_lexical(judged)
+    # Records flagged with errors (prediction-stage: LLM outage / incomplete
+    # memory build; or judge-stage: judge API failure) are EXCLUDED from every
+    # metric - an infrastructure failure is not a model mistake. They are still
+    # counted and reported via n_error / error_rate.
+    valid = [r for r in judged if not r.get("error") and not r.get("judge_error")]
+    lexical = aggregate_lexical(valid)
     by_cat = {}
     cats = sorted({r.get("category") for r in judged})
     for cat in cats:
         rows = [r for r in judged if r.get("category") == cat]
-        scored = [r for r in rows if "judge_score" in r]
+        scored = [r for r in rows
+                  if "judge_score" in r and not r.get("error") and not r.get("judge_error")]
         lex = lexical["by_category"].get(cat, {"n": 0, "f1": None, "bleu_sentence": None, "bleu_corpus": None, "bleu_1": None, "bleu_corpus_1": None})
         by_cat[cat] = {
             "n_predictions": len(rows),
             "n_judged": len(scored),
+            "n_error": sum(1 for r in rows if r.get("error") or r.get("judge_error")),
             "judge_accuracy_strict": round(
                 sum(1 for r in scored if r.get("judge_label") == "correct") / len(scored), 4
             ) if scored else None,
@@ -728,11 +809,15 @@ def summarize(judged):
             "bleu_corpus_1": lex.get("bleu_corpus_1"),
         }
 
-    scored_all = [r for r in judged if "judge_score" in r]
+    scored_all = [r for r in judged
+                  if "judge_score" in r and not r.get("error") and not r.get("judge_error")]
+    n_error_all = sum(1 for r in judged if r.get("error") or r.get("judge_error"))
     summary = {
         "overall": {
             "n_predictions": len(judged),
             "n_judged": len(scored_all),
+            "n_error": n_error_all,
+            "error_rate": round(n_error_all / len(judged), 4) if judged else None,
             "judge_accuracy_strict": round(
                 sum(1 for r in scored_all if r.get("judge_label") == "correct") / len(scored_all), 4
             ) if scored_all else None,
@@ -751,7 +836,8 @@ def print_summary(summary):
     print("\n" + "=" * 78)
     print("OVERALL  (F1/BLEU on gold-answer samples only; judge over all samples)")
     print("=" * 78)
-    print(f"  predictions={o['n_predictions']}  judged={o['n_judged']}  gold={o.get('n', 0)}")
+    print(f"  predictions={o['n_predictions']}  judged={o['n_judged']}  gold={o.get('n', 0)}"
+          f"  errors(excluded)={o.get('n_error', 0)}")
     print(f"  judge accuracy (strict)     : {o['judge_accuracy_strict']}")
     print(f"  judge score (partial=0.5)   : {o['judge_score_avg']}")
     print(f"  F1                          : {o.get('f1')}")
@@ -760,13 +846,19 @@ def print_summary(summary):
     print(f"  BLEU-1 (sentence, paper)    : {o.get('bleu_1')}")
     print(f"  BLEU-1 (corpus)             : {o.get('bleu_corpus_1')}")
     print("-" * 78)
-    header = f"  {'category':<12}{'n':>5}{'judg':>6}{'judAcc':>9}{'judAvg':>8}{'nGold':>7}{'F1':>8}{'BLEU1':>8}"
+    header = f"  {'category':<12}{'n':>5}{'judg':>6}{'judAcc':>9}{'judAvg':>8}{'nGold':>7}{'F1':>8}{'BLEU1':>8}{'err':>5}"
     print(header)
     for cat, s in summary["by_category"].items():
         print(f"  {cat:<12}{s['n_predictions']:>5}{s['n_judged']:>6}"
               f"{str(s['judge_accuracy_strict']):>9}{str(s['judge_score_avg']):>8}"
-              f"{s['n_gold']:>7}{str(s['f1']):>8}{str(s['bleu_1']):>8}")
+              f"{s['n_gold']:>7}{str(s['f1']):>8}{str(s['bleu_1']):>8}{s['n_error']:>5}")
     print("=" * 78)
+    if o.get("n_error"):
+        print("!" * 78)
+        print(f"  WARNING: {o['n_error']} record(s) had errors and were EXCLUDED from")
+        print( "  every metric above. Fix the cause (usually LLM API rate limiting)")
+        print( "  and re-run before trusting these numbers.")
+        print("!" * 78)
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +891,10 @@ def main():
                         help="Skip samples already present in predictions.jsonl / judged.jsonl")
     parser.add_argument("--keep-cognitive-db", action="store_true",
                         help="Keep per-sample cognitive LanceDB stores (deleted by default)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Exit with code 1 if any record has errors (they are excluded "
+                             "from metrics). Use for unattended runs so a throttled or "
+                             "half-failed run can never be mistaken for a result.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--run-tag", default="", help="Optional suffix for the log file name")
     args = parser.parse_args()
@@ -856,6 +952,29 @@ def main():
 
         existing = read_jsonl(predictions_path)
         done_ids = {r["sample_id"] for r in existing}
+        if args.resume and existing:
+            # Error-flagged predictions are retried on resume instead of being
+            # kept as permanent holes in the metrics.
+            retry_ids = {r["sample_id"] for r in existing if r.get("error")}
+            if retry_ids:
+                kept = [r for r in existing if not r.get("error")]
+                with io.open(predictions_path, "w", encoding="utf-8") as f:
+                    for r in kept:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                done_ids = {r["sample_id"] for r in kept}
+                logger.info("Resuming: dropped %d error-flagged predictions for retry",
+                            len(retry_ids))
+                judged_path_retry = out_dir / "judged.jsonl"
+                if judged_path_retry.exists():
+                    jrows = read_jsonl(judged_path_retry)
+                    jkept = [r for r in jrows
+                             if r["sample_id"] not in retry_ids and not r.get("judge_error")]
+                    if len(jkept) != len(jrows):
+                        with io.open(judged_path_retry, "w", encoding="utf-8") as f:
+                            for r in jkept:
+                                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                        logger.info("Resuming: dropped %d stale judged rows for retry",
+                                    len(jrows) - len(jkept))
         if args.resume:
             logger.info("Resuming: %d predictions already present", len(done_ids))
 
@@ -891,6 +1010,13 @@ def main():
         with io.open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print_summary(summary)
+        n_err = sum(1 for r in merged if r.get("error") or r.get("judge_error"))
+        if n_err:
+            logger.error("%d record(s) flagged with errors were EXCLUDED from all metrics",
+                         n_err)
+            if args.strict:
+                logger.error("--strict: exiting with code 1; fix the errors and re-run")
+                sys.exit(1)
         logger.info("Run finished in %.1fs", (datetime.now() - started_at).total_seconds())
         logger.info("Artifacts:")
         logger.info("  predictions : %s", predictions_path)

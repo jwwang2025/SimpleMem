@@ -15,6 +15,7 @@ from simplemem.core.settings import settings as config
 import json
 import asyncio
 import concurrent.futures
+import threading
 from functools import partial
 
 
@@ -52,8 +53,21 @@ class MemoryBuilder:
         self.dialogue_buffer: List[Dialogue] = []
         self.processed_count = 0
 
+        # Windows whose LLM extraction failed after all retries. Any non-zero
+        # value means the memory store is INCOMPLETE: callers must flag the
+        # sample as an error instead of silently degrading retrieval quality
+        # (the failure mode that ruined the 2026-10-12 full run).
+        self.failed_windows = 0
+        self._failed_windows_lock = threading.Lock()
+
         # Previous window entries (for context)
         self.previous_entries: List[MemoryEntry] = []
+
+    def _note_window_failure(self) -> int:
+        """Thread-safe: count a window whose extraction failed after all retries."""
+        with self._failed_windows_lock:
+            self.failed_windows += 1
+            return self.failed_windows
 
     def add_dialogue(self, dialogue: Dialogue, auto_process: bool = True):
         """
@@ -198,8 +212,8 @@ class MemoryBuilder:
             }
         ]
 
-        # Retry up to 3 times if parsing fails
-        max_retries = 3
+        # Retry up to LLM_EXTRACT_MAX_RETRIES times if parsing fails
+        max_retries = max(1, int(getattr(config, "LLM_EXTRACT_MAX_RETRIES", 10)))
         for attempt in range(max_retries):
             try:
                 # Use JSON format if configured
@@ -222,8 +236,12 @@ class MemoryBuilder:
                     print(f"Attempt {attempt + 1}/{max_retries} failed to parse LLM response: {e}")
                     print(f"Retrying...")
                 else:
+                    failed = self._note_window_failure()
                     print(f"All {max_retries} attempts failed to parse LLM response: {e}")
                     print(f"Raw response: {response[:500] if 'response' in locals() else 'No response'}")
+                    print(f"ERROR: memory extraction FAILED for this window "
+                          f"(failed windows so far: {failed}); the sample "
+                          f"will be flagged as error and excluded from metrics")
                     return []
 
     def _build_extraction_prompt(
@@ -405,8 +423,8 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
             }
         ]
 
-        # Retry up to 3 times if parsing fails
-        max_retries = 3
+        # Retry up to LLM_EXTRACT_MAX_RETRIES times if parsing fails
+        max_retries = max(1, int(getattr(config, "LLM_EXTRACT_MAX_RETRIES", 10)))
         for attempt in range(max_retries):
             try:
                 # Use JSON format if configured
@@ -429,5 +447,9 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
                 if attempt < max_retries - 1:
                     print(f"[Worker {window_num}] Attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
                 else:
+                    failed = self._note_window_failure()
                     print(f"[Worker {window_num}] All {max_retries} attempts failed: {e}")
+                    print(f"[Worker {window_num}] ERROR: memory extraction FAILED for this window "
+                          f"(failed windows so far: {failed}); the sample will be "
+                          f"flagged as error and excluded from metrics")
                     return []

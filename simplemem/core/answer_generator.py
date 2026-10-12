@@ -51,8 +51,8 @@ class AnswerGenerator:
             }
         ]
 
-        # Retry up to 3 times
-        max_retries = 3
+        # Retry up to LLM_ANSWER_MAX_RETRIES times
+        max_retries = max(1, int(getattr(config, "LLM_ANSWER_MAX_RETRIES", 10)))
         for attempt in range(max_retries):
             try:
                 # Use JSON format if configured
@@ -76,11 +76,16 @@ class AnswerGenerator:
                     print(f"Answer generation attempt {attempt + 1}/{max_retries} failed: {e}. Retrying...")
                 else:
                     print(f"Warning: Failed to parse JSON response after {max_retries} attempts: {e}")
-                    # Fallback to raw response
+                    # Fallback to raw response when the API answered but the
+                    # JSON could not be parsed. When NO response was ever
+                    # obtained the sample is invalid: raise so the eval flags
+                    # it as an error instead of silently recording a fake
+                    # "Failed to generate answer" that the judge scores wrong.
                     if 'response' in locals():
                         return response.strip()
-                    else:
-                        return "Failed to generate answer"
+                    raise RuntimeError(
+                        f"answer generation failed after {max_retries} attempts: {e}"
+                    ) from e
 
     def _format_contexts(self, contexts: List[MemoryEntry]) -> str:
         """

@@ -37,6 +37,21 @@ _DEFAULTS = {
     "ENABLE_PLANNING": True,
     "ENABLE_REFLECTION": True,
     "MAX_REFLECTION_ROUNDS": 2,
+    # --- LLM retry / rate-limit resilience ---
+    # SiliconFlow free tier (Qwen/Qwen3-8B): 1000 RPM / 50K TPM, defined at the
+    # ACCOUNT level and per model. A 48-concurrency run without jittered backoff
+    # produced a retry storm (~3,200 attempts/min > 1000 RPM) and 99% of chat
+    # requests were rejected with 429, silently destroying 93% of extraction
+    # windows. These defaults make every LLM call survive rate limiting.
+    "LLM_MAX_RETRIES": 10,            # attempts per logical LLM call (was 3)
+    "LLM_RETRY_BASE_DELAY": 1.0,      # seconds; exponential base
+    "LLM_RETRY_MAX_DELAY": 60.0,      # per-sleep cap for rate-limit errors
+    "LLM_RETRY_JITTER": 1.0,          # 1.0 = full jitter sleep ~ U(0, delay)
+    "LLM_SDK_MAX_RETRIES": 0,         # disable OpenAI SDK internal retries; we own retries
+    "LLM_EXTRACT_MAX_RETRIES": 10,    # memory-builder per-window retries (was 3)
+    "LLM_ANSWER_MAX_RETRIES": 10,     # answer-generator retries (was 3)
+    "JUDGE_MAX_RETRIES": 10,          # LLM-as-judge retries (was 3)
+    "JUDGE_RETRY_BASE_DELAY": 2.0,    # judge backoff base (seconds)
 }
 
 
