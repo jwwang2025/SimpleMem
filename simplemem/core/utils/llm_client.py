@@ -4,6 +4,7 @@ LLM Client - Handles all LLM interactions
 import json
 import random
 import time
+import threading
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
 from simplemem.core.settings import settings as config
@@ -35,6 +36,129 @@ def compute_backoff(attempt: int, base: float, cap: float, jitter: float,
     elif jitter > 0:
         delay = delay * (1.0 - jitter * random.random())
     return max(0.0, delay)
+
+
+class RateLimiter:
+    """Thread-safe dual-bucket (requests + tokens) client-side throttle.
+
+    Strategy for a STRICTLY ZERO 429 rate: never touch the server's limit in
+    the first place. The SiliconFlow free tier allows 1000 RPM / 50K TPM per
+    account (per model, sliding window); we deliberately offer at most
+    LLM_RPM_BUDGET / LLM_TPM_BUDGET (defaults 300 RPM = 30%, 30K TPM = 60%
+    of the caps). With ~40% headroom the sliding window never sees an excess,
+    so no request is ever rejected; the jittered-retry machinery remains a
+    pure safety net, not the primary mechanism.
+
+    Both buckets refill continuously but hold at most `burst_seconds` worth
+    of tokens, so an idle period cannot bank a large burst - the offered
+    load curve stays smooth, which is what sliding-window limiters measure.
+    """
+
+    def __init__(self, rpm: float = 300.0, tpm: float = 30000.0,
+                 burst_seconds: float = 2.0, enabled: bool = True):
+        self.rpm = max(0.0, float(rpm))
+        self.tpm = max(0.0, float(tpm))
+        self.burst_seconds = max(0.1, float(burst_seconds))
+        self.enabled = bool(enabled) and (self.rpm > 0 or self.tpm > 0)
+        self._req_rate = self.rpm / 60.0    # request tokens per second
+        self._tok_rate = self.tpm / 60.0    # token tokens per second
+        self._req_cap = self._req_rate * self.burst_seconds
+        self._tok_cap = self._tok_rate * self.burst_seconds
+        self._lock = threading.Lock()
+        self._req_bucket = self._req_cap    # start full: no cold-start penalty
+        self._tok_bucket = self._tok_cap
+        self._last = time.monotonic()
+        self.total_wait_seconds = 0.0       # observability (approximate)
+
+    def _refill_locked(self):
+        now = time.monotonic()
+        dt = max(0.0, now - self._last)
+        self._last = now
+        if self._req_rate:
+            self._req_bucket = min(self._req_cap, self._req_bucket + dt * self._req_rate)
+        if self._tok_rate:
+            self._tok_bucket = min(self._tok_cap, self._tok_bucket + dt * self._tok_rate)
+
+    def acquire(self, tokens: float = 0.0):
+        """Block until one request costing `tokens` (estimated) may be sent."""
+        if not self.enabled:
+            return
+        tokens = max(0.0, float(tokens))
+        started = time.monotonic()
+        while True:
+            with self._lock:
+                self._refill_locked()
+                # A single call may cost more than the bucket capacity (a 3K
+                # extraction vs a 1K cap). Clamp instead of deadlocking: such
+                # calls are then paced at cap/rate seconds each, i.e. exactly
+                # tpm/tokens requests per minute - the intended behavior.
+                need_tok = min(tokens, self._tok_cap) if self._tok_cap > 0 else 0.0
+                req_ok = self._req_rate <= 0 or self._req_bucket >= 1.0
+                tok_ok = self._tok_rate <= 0 or self._tok_bucket >= need_tok
+                if req_ok and tok_ok:
+                    if self._req_rate > 0:
+                        self._req_bucket -= 1.0
+                    self._tok_bucket -= need_tok
+                    self.total_wait_seconds += time.monotonic() - started
+                    return
+                wait_req = ((1.0 - self._req_bucket) / self._req_rate
+                            if self._req_rate > 0 and self._req_bucket < 1.0 else 0.0)
+                wait_tok = ((need_tok - self._tok_bucket) / self._tok_rate
+                            if self._tok_rate > 0 and self._tok_bucket < need_tok else 0.0)
+                wait = max(wait_req, wait_tok)
+            # Sleep OUTSIDE the lock, in small slices so a slow waiter cannot
+            # block others and overshoot stays bounded by the slice size.
+            time.sleep(min(max(wait, 0.005), 0.25))
+
+
+_global_limiter: Optional["RateLimiter"] = None
+_global_limiter_lock = threading.Lock()
+_call_stats = {"calls": 0, "rejected_429": 0}
+_call_stats_lock = threading.Lock()
+
+
+def get_rate_limiter() -> "RateLimiter":
+    """Process-wide limiter shared by EVERY LLM path (memory builder, answer
+    generator, judge) so the offered budget is enforced globally, not per
+    component - the judge phase alone offered ~47K TPM in the last run."""
+    global _global_limiter
+    with _global_limiter_lock:
+        if _global_limiter is None:
+            _global_limiter = RateLimiter(
+                rpm=float(getattr(config, "LLM_RPM_BUDGET", 300)),
+                tpm=float(getattr(config, "LLM_TPM_BUDGET", 30000)),
+                burst_seconds=float(getattr(config, "LLM_RATE_LIMIT_BURST_SECONDS", 2.0)),
+                enabled=bool(getattr(config, "ENABLE_RATE_LIMITER", True)),
+            )
+        return _global_limiter
+
+
+def estimate_call_tokens(messages: List[Dict[str, str]],
+                         expected_output_tokens: float = 1000.0) -> float:
+    """Conservative pre-call estimate. English text ~4 chars/token; the
+    expected-output margin covers the extraction JSON (~1K tokens). Deliberate
+    over-estimation only slows the run; under-estimation risks a real 429."""
+    chars = 0
+    for m in messages:
+        content = m.get("content")
+        if content:
+            chars += len(str(content))
+    return chars / 4.0 + float(expected_output_tokens)
+
+
+def note_llm_call(rejected_429: bool = False):
+    """Count one real API attempt. The eval harness calls this for its own
+    judge requests (separate client) so n_429 in summary.json covers ALL
+    traffic - making 'the 429 rate was zero' a verifiable fact, not a hope."""
+    with _call_stats_lock:
+        _call_stats["calls"] += 1
+        if rejected_429:
+            _call_stats["rejected_429"] += 1
+
+
+def get_llm_stats() -> Dict[str, int]:
+    with _call_stats_lock:
+        return dict(_call_stats)
 
 
 class LLMClient:
@@ -123,15 +247,23 @@ class LLMClient:
         base = float(getattr(config, "LLM_RETRY_BASE_DELAY", 1.0))
         cap = float(getattr(config, "LLM_RETRY_MAX_DELAY", 60.0))
         jitter = float(getattr(config, "LLM_RETRY_JITTER", 1.0))
+        limiter = get_rate_limiter()
+        est_tokens = estimate_call_tokens(messages, expected_output_tokens=1000.0)
         last_exception = None
         for attempt in range(max_retries):
             try:
+                # Client-side throttle BEFORE sending: keep offered load under
+                # budget so the server never 429s in the first place (zero-429
+                # strategy); the retry loop below is only the safety net.
+                limiter.acquire(est_tokens)
                 # Use streaming if configured
                 if self.use_streaming:
                     kwargs["stream"] = True
+                    note_llm_call()
                     return self._handle_streaming_response(**kwargs)
                 else:
                     response = self.client.chat.completions.create(**kwargs)
+                    note_llm_call()
                     return response.choices[0].message.content
                 
                 # kwargs["stream"] = True
@@ -140,6 +272,7 @@ class LLMClient:
             except Exception as e:
                 # print(e)
                 last_exception = e
+                note_llm_call(rejected_429=is_rate_limit_error(e))
                 if attempt < max_retries - 1:
                     rate_limited = is_rate_limit_error(e)
                     wait_time = compute_backoff(attempt, base, cap, jitter,

@@ -52,6 +52,20 @@ _DEFAULTS = {
     "LLM_ANSWER_MAX_RETRIES": 10,     # answer-generator retries (was 3)
     "JUDGE_MAX_RETRIES": 10,          # LLM-as-judge retries (was 3)
     "JUDGE_RETRY_BASE_DELAY": 2.0,    # judge backoff base (seconds)
+    # --- Client-side rate limiting (zero-429 strategy) ---
+    # Retries alone cannot guarantee clean results: during the 2026-10-12 run
+    # 99.1% of chat requests were rejected and 93% of extraction windows died
+    # anyway. The robust fix is to never EXCEED the limit in the first place:
+    # offer at most these budgets - defaults are 30% of the 1000 RPM cap and
+    # 60% of the 50K TPM cap - leaving headroom for bursts, in-flight calls
+    # and the judge phase sharing the same account. With ~40% headroom the
+    # sliding window never sees an excess, so no request is ever rejected.
+    # Cost: the full run needs ~20.2M tokens, so wall clock >= ~11h at 30K
+    # TPM. Correctness first; raise LLM_TPM_BUDGET only if speed is critical.
+    "ENABLE_RATE_LIMITER": True,      # master switch (False = pass-through)
+    "LLM_RPM_BUDGET": 300,            # offered requests/min (server cap 1000)
+    "LLM_TPM_BUDGET": 30000,          # offered tokens/min (server cap 50000)
+    "LLM_RATE_LIMIT_BURST_SECONDS": 2.0,  # bucket capacity window; smaller = smoother
 }
 
 

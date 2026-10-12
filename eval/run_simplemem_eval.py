@@ -652,7 +652,10 @@ def parse_judge_response(raw: str):
 def run_judge(args, predictions, judged_path, done_judged):
     from openai import OpenAI
     from simplemem.core.settings import settings
-    from simplemem.core.utils.llm_client import compute_backoff, is_rate_limit_error
+    from simplemem.core.utils.llm_client import (
+        compute_backoff, is_rate_limit_error, get_rate_limiter,
+        estimate_call_tokens, note_llm_call,
+    )
 
     # Precedence: CLI --judge-model > config JUDGE_* > config OPENAI_*/LLM_MODEL
     api_key = settings.JUDGE_API_KEY or settings.OPENAI_API_KEY
@@ -711,6 +714,12 @@ def run_judge(args, predictions, judged_path, done_judged):
                     "siliconflow.cn" in base_url or "dashscope.aliyuncs.com" in base_url
                 ):
                     judge_extra_body = {"enable_thinking": False}
+                # Same client-side throttle as the main client: the judge
+                # phase shares the account budget (it alone offered ~47K TPM
+                # in the last run, riding the 50K cap).
+                get_rate_limiter().acquire(estimate_call_tokens(
+                    [{"role": "user", "content": prompt}],
+                    expected_output_tokens=300.0))
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
@@ -722,8 +731,10 @@ def run_judge(args, predictions, judged_path, done_judged):
                 if not raw:
                     raise RuntimeError(
                         "judge returned empty content (reasoning token budget exhausted?)")
+                note_llm_call()
                 break
             except Exception as exc:
+                note_llm_call(rejected_429=is_rate_limit_error(exc))
                 if attempt < judge_max_retries - 1:
                     wait = compute_backoff(attempt, judge_base, judge_cap, judge_jitter,
                                            rate_limit=is_rate_limit_error(exc))
@@ -845,6 +856,11 @@ def print_summary(summary):
     print(f"  BLEU (corpus)               : {o.get('bleu_corpus')}")
     print(f"  BLEU-1 (sentence, paper)    : {o.get('bleu_1')}")
     print(f"  BLEU-1 (corpus)             : {o.get('bleu_corpus_1')}")
+    rl = o.get("rate_limiter") or {}
+    if rl:
+        print(f"  LLM calls / 429 rejected    : {o.get('n_llm_calls')} / {o.get('n_429')}"
+              f"   (throttle {int(rl.get('tpm_budget', 0))} TPM / "
+              f"{int(rl.get('rpm_budget', 0))} RPM, waited {rl.get('total_wait_seconds', 0)}s)")
     print("-" * 78)
     header = f"  {'category':<12}{'n':>5}{'judg':>6}{'judAcc':>9}{'judAvg':>8}{'nGold':>7}{'F1':>8}{'BLEU1':>8}{'err':>5}"
     print(header)
@@ -1007,16 +1023,35 @@ def main():
                 )
         merged = list(lex_rows.values())
         summary = summarize(merged)
+        # Verifiable rate-limit accounting: every real API attempt (main client
+        # + judge) is counted, so "the 429 rate was zero" becomes a fact in
+        # summary.json instead of a hope. --strict treats ANY 429 as failure.
+        from simplemem.core.utils.llm_client import get_llm_stats, get_rate_limiter
+        stats = get_llm_stats()
+        limiter = get_rate_limiter()
+        summary["overall"]["n_llm_calls"] = stats["calls"]
+        summary["overall"]["n_429"] = stats["rejected_429"]
+        summary["overall"]["rate_limiter"] = {
+            "enabled": limiter.enabled,
+            "rpm_budget": limiter.rpm,
+            "tpm_budget": limiter.tpm,
+            "total_wait_seconds": round(limiter.total_wait_seconds, 1),
+        }
         with io.open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         print_summary(summary)
         n_err = sum(1 for r in merged if r.get("error") or r.get("judge_error"))
+        n_429 = stats["rejected_429"]
         if n_err:
             logger.error("%d record(s) flagged with errors were EXCLUDED from all metrics",
                          n_err)
-            if args.strict:
-                logger.error("--strict: exiting with code 1; fix the errors and re-run")
-                sys.exit(1)
+        if n_429:
+            logger.error("%d request(s) rejected with 429 despite the client-side throttle "
+                         "(budget %d TPM / %d RPM) - lower LLM_TPM_BUDGET or concurrency "
+                         "and re-run", n_429, int(limiter.tpm), int(limiter.rpm))
+        if (n_err or n_429) and args.strict:
+            logger.error("--strict: exiting with code 1; fix the errors and re-run")
+            sys.exit(1)
         logger.info("Run finished in %.1fs", (datetime.now() - started_at).total_seconds())
         logger.info("Artifacts:")
         logger.info("  predictions : %s", predictions_path)
