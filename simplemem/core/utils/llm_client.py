@@ -80,7 +80,21 @@ class RateLimiter:
             self._tok_bucket = min(self._tok_cap, self._tok_bucket + dt * self._tok_rate)
 
     def acquire(self, tokens: float = 0.0):
-        """Block until one request costing `tokens` (estimated) may be sent."""
+        """Block until one request costing `tokens` (estimated) may be sent.
+
+        Debt-based token accounting: a call is charged its FULL cost even when
+        that exceeds the burst capacity, driving the token bucket negative;
+        subsequent calls then wait until the debt is repaid. Steady-state
+        offered load is therefore exactly tok_rate (tpm/60 tokens per second)
+        regardless of call size, while bursts stay bounded by tok_cap.
+
+        The previous implementation clamped the charge to tok_cap, which
+        under-metered every large call by up to tok_cap/tokens (3.5x at the
+        24K TPM / 2s-burst defaults vs 2.8K-token extraction calls): the
+        EWMA-calibrated estimate was computed correctly and then thrown away,
+        so the true offered TPM ran ~84K against the 50K cap and 429s
+        returned in a steady stream (4,217 of them between 01:38 and 10:25).
+        """
         if not self.enabled:
             return
         tokens = max(0.0, float(tokens))
@@ -88,23 +102,22 @@ class RateLimiter:
         while True:
             with self._lock:
                 self._refill_locked()
-                # A single call may cost more than the bucket capacity (a 3K
-                # extraction vs a 1K cap). Clamp instead of deadlocking: such
-                # calls are then paced at cap/rate seconds each, i.e. exactly
-                # tpm/tokens requests per minute - the intended behavior.
-                need_tok = min(tokens, self._tok_cap) if self._tok_cap > 0 else 0.0
                 req_ok = self._req_rate <= 0 or self._req_bucket >= 1.0
-                tok_ok = self._tok_rate <= 0 or self._tok_bucket >= need_tok
+                # Admit only when no token debt is outstanding; the full cost
+                # is then deducted (bucket may go negative - that debt paces
+                # the following calls).
+                tok_ok = self._tok_rate <= 0 or self._tok_bucket >= 0.0
                 if req_ok and tok_ok:
                     if self._req_rate > 0:
                         self._req_bucket -= 1.0
-                    self._tok_bucket -= need_tok
+                    if self._tok_rate > 0:
+                        self._tok_bucket -= tokens
                     self.total_wait_seconds += time.monotonic() - started
                     return
                 wait_req = ((1.0 - self._req_bucket) / self._req_rate
                             if self._req_rate > 0 and self._req_bucket < 1.0 else 0.0)
-                wait_tok = ((need_tok - self._tok_bucket) / self._tok_rate
-                            if self._tok_rate > 0 and self._tok_bucket < need_tok else 0.0)
+                wait_tok = ((0.0 - self._tok_bucket) / self._tok_rate
+                            if self._tok_rate > 0 and self._tok_bucket < 0.0 else 0.0)
                 wait = max(wait_req, wait_tok)
             # Sleep OUTSIDE the lock, in small slices so a slow waiter cannot
             # block others and overshoot stays bounded by the slice size.

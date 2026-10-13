@@ -8,19 +8,27 @@
 #   - PRIMARY defense: client-side token-bucket throttle (RateLimiter in
 #     simplemem/core/utils/llm_client.py) caps OFFERED load at 300 RPM / 24K TPM
 #     (= 30% / 48% of the caps) across ALL LLM paths (memory builder, answer
-#     generator, judge) via a process-wide singleton. Estimates are calibrated
-#     against real response usage (EWMA) because Qwen3's actual output ran
-#     ~1.5x the static estimate - without calibration the true offered TPM
-#     exceeded the cap and drew steady-state 429s (observed 00:04-00:25).
+#     generator, judge) via a process-wide singleton. Debt-based accounting:
+#     every call is charged its FULL estimated cost (bucket may go negative),
+#     so steady-state offered TPM is exactly the budget regardless of call
+#     size. (v3.1 history: the first limiter clamped each charge to the burst
+#     capacity, under-metering 2.8K-token extraction calls by ~3.5x - it
+#     believed it offered 24K while truly offering up to ~84K, drawing 4,217
+#     x 50602 between 01:38 and 10:25. Estimates are additionally calibrated
+#     against real response usage via EWMA.)
 #   - cognitive-concurrency 20 is just parallelism; the throttle paces the
 #     offered load (48 workers without throttle offered 61K TPM = 123% of cap).
 #   - SAFETY NET: up to 10 attempts per call with jittered exponential backoff.
 #   - ACCOUNTING: summary.json reports n_llm_calls / n_429 / rate_limiter;
 #     --strict exits 1 on ANY sample error OR ANY 429.
-#   - v3 restart (00:30): first 2h ran with the un-calibrated 30K budget and
-#     drew 252 x 429 (all retried away, no hard failures, 38 samples done and
-#     kept). This relaunch resumes those 38 samples via --resume; the previous
-#     run log is kept as locomo_plus_v3_run.log.
+#   - Restart history:
+#       run.log  (18:05, 48 workers, no throttle) -> 99% rejected, results void
+#       run2 era: 30K budget, un-calibrated estimates -> 252 x 429 (00:04-00:25)
+#       run2 era: 24K + EWMA calibration            -> 4,217 x 429 (01:38-10:25),
+#                root-caused to the charge-clamp bug above; also surfaced a
+#                latent hybrid_retriever schema bug (Qwen3 returning a JSON
+#                array where an object was required crashed 2 samples)
+#       run3 (this): both fixed; resumes the 249 completed samples.
 cd /home/apulis-dev/code/SimpleMem
 source /home/apulis-dev/code/envs/simplemem/bin/activate || exit 1
 export TOKENIZERS_PARALLELISM=false
@@ -32,5 +40,5 @@ setsid nohup python eval/run_simplemem_eval.py \
   --cognitive-concurrency 20 \
   --judge-model Qwen/Qwen3-8B --judge-concurrency 8 --run-model Qwen/Qwen3-8B \
   --out-dir eval_output/locomo_plus_v3 --run-tag locomo_plus_v3 --strict \
-  > /home/apulis-dev/code/SimpleMem/eval_output/locomo_plus_v3_run2.log 2>&1 < /dev/null &
+  > /home/apulis-dev/code/SimpleMem/eval_output/locomo_plus_v3_run3.log 2>&1 < /dev/null &
 echo "launched LoCoMo-Plus (Cognitive) eval (resume), pid $!"

@@ -17,6 +17,21 @@ import dateparser
 import concurrent.futures
 
 
+def _require_dict(result: Any, what: str) -> Dict[str, Any]:
+    """Validate an LLM JSON extraction result is an object.
+
+    Qwen3 (non-thinking, temp 0.1-0.2) occasionally ignores the requested
+    schema and emits a bare JSON array; every consumer below calls .get() or
+    ['key'] on the result, which used to crash the whole sample with
+    "'list' object has no attribute 'get'" (cognitive-73 / cognitive-151).
+    Raising here routes the call into each site's existing except/fallback.
+    """
+    if not isinstance(result, dict):
+        raise ValueError(
+            f"{what} is not a JSON object: {type(result).__name__}")
+    return result
+
+
 class HybridRetriever:
     """
     Hybrid Retriever - Intent-Aware Retrieval Planning (Section 3.3)
@@ -223,6 +238,29 @@ Return ONLY JSON, no other content.
                     response_format=response_format
                 )
                 analysis = self.llm_client.extract_json(response)
+                # Qwen3 occasionally ignores the requested schema and returns a
+                # bare JSON array (e.g. ["Caroline", "Melanie"]). Downstream
+                # consumers call .get() on the result, so coerce here: a list
+                # of strings is treated as the keyword list, anything else
+                # raises so the retry/fallback path below can take over.
+                # (Uncoerced, this crashed two samples with
+                # "'list' object has no attribute 'get'".)
+                if isinstance(analysis, list):
+                    items = [str(x) for x in analysis if isinstance(x, (str, int, float))]
+                    if items:
+                        analysis = {
+                            "keywords": items,
+                            "persons": [],
+                            "time_expression": None,
+                            "location": None,
+                            "entities": [],
+                        }
+                    else:
+                        raise ValueError(
+                            f"query analysis returned a non-string list: {analysis!r:.200}")
+                if not isinstance(analysis, dict):
+                    raise ValueError(
+                        f"query analysis is not a JSON object: {type(analysis).__name__}")
                 return analysis
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -254,6 +292,8 @@ Return ONLY JSON, no other content.
         Lexical Layer Retrieval (Section 3.3)
         R_lex = Top-n(BM25(q_lex, m_i))
         """
+        if not isinstance(query_analysis, dict):
+            query_analysis = {}
         keywords = query_analysis.get("keywords", [])
         if not keywords:
             # If no keywords extracted, use query itself
@@ -266,6 +306,8 @@ Return ONLY JSON, no other content.
         Symbolic Layer Retrieval (Section 3.3)
         R_sym = Top-n({m_i | Meta(m_i) ⊨ q_sym})
         """
+        if not isinstance(query_analysis, dict):
+            query_analysis = {}
         persons = query_analysis.get("persons", [])
         location = query_analysis.get("location")
         entities = query_analysis.get("entities", [])
@@ -392,7 +434,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "targeted queries")
             queries = result.get("queries", [query])
             
             # Ensure original query is included
@@ -475,7 +518,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "answer adequacy")
             return result.get("assessment", "insufficient")
             
         except Exception as e:
@@ -536,7 +580,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "additional queries")
             return result.get("additional_queries", [])
             
         except Exception as e:
@@ -702,7 +747,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "information plan")
             return result
             
         except Exception as e:
@@ -773,7 +819,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "reflection queries")
             queries = result.get("queries", [original_query])
             
             # Ensure original query is included and limit to reasonable number
@@ -893,7 +940,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "completeness analysis")
             assessment = result.get("assessment", "incomplete")
             coverage = result.get("coverage_percentage", 0)
             
@@ -958,7 +1006,8 @@ Return ONLY the JSON, no other text.
                 response_format=response_format
             )
             
-            result = self.llm_client.extract_json(response)
+            result = _require_dict(self.llm_client.extract_json(response),
+                                   "missing-info queries")
             queries = result.get("targeted_queries", [])
             
             print(f"[Intelligent Reflection] Missing info: {result.get('missing_analysis', 'Unknown')}")
