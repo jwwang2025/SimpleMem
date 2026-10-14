@@ -458,7 +458,7 @@ def run_one_locomo_conversation(ci, args, item, qa_rows, out_dir, SystemCls,
 
     t_ask = time.time()
     n_qa = len(qa_rows)
-    for q_idx, qa in enumerate(qa_rows, start=1):
+    for q_idx, (qi, qa) in enumerate(qa_rows, start=1):
         sid = f"locomo-{ci}-qa-{qi}"
         if sid in done_ids:
             continue
@@ -553,9 +553,20 @@ def run_locomo(args, locomo_data, out_dir, done_ids, predictions_path):
                                qa_rows, out_dir, SystemCls, done_ids,
                                write_lock, predictions_path)
                    for ci, item, qa_rows, _ in pending]
+        worker_errors = []
         try:
             for fut in as_completed(futures):
-                _consume(*fut.result())
+                try:
+                    _consume(*fut.result())
+                except Exception:
+                    # A worker raising must NOT kill coordination for the
+                    # others (that leaves the pool half-dead with no summary
+                    # and no error record - the 2026-10-15 incident). Log it,
+                    # keep consuming every future, then fail loudly at the end
+                    # so --strict still aborts and --resume can retry just the
+                    # broken conversation.
+                    log.exception("[LoCoMo] worker raised unexpectedly")
+                    worker_errors.append(fut.exception())
         except KeyboardInterrupt:
             # Persisted records stay valid; --resume skips them on restart.
             log.warning("[LoCoMo] interrupted; cancelling queued work "
@@ -564,6 +575,8 @@ def run_locomo(args, locomo_data, out_dir, done_ids, predictions_path):
             raise
         else:
             pool.shutdown(wait=True)
+        if worker_errors:
+            raise worker_errors[0]
 
     log.info("[LoCoMo] stage finished: %d QA persisted this run, %.1fs total",
              n_written, time.time() - t_stage)
