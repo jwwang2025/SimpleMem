@@ -48,6 +48,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -382,107 +383,190 @@ def append_jsonl(path: Path, rows):
 # Prediction stages
 # ---------------------------------------------------------------------------
 
-def run_locomo(args, locomo_data, out_dir, done_ids, predictions_path):
-    SystemCls = load_simplemem_system_cls()
-    n_conv = len(locomo_data) if not args.limit_conv else min(args.limit_conv, len(locomo_data))
-    for ci in range(n_conv):
-        item = locomo_data[ci]
-        conv = item["conversation"]
-        qa_rows = sample_qa(item.get("qa") or [], args.qa_per_category, args.seed + ci)
-        expected_ids = {f"locomo-{ci}-qa-{qi}" for qi, _ in qa_rows}
-        if args.resume and expected_ids and expected_ids <= done_ids:
-            log.info("[LoCoMo] conv %d: all %d predictions exist, skipping memory build",
-                     ci, len(expected_ids))
-            continue
+def run_one_locomo_conversation(ci, args, item, qa_rows, out_dir, SystemCls,
+                                done_ids, write_lock, predictions_path):
+    """
+    Build an independent SimpleMem memory store for ONE LoCoMo conversation and
+    answer its sampled QA turns. Every call owns its own system / LanceDB
+    directory (db/conv_<ci>), so it is safe to invoke concurrently from a
+    ThreadPoolExecutor - the same pattern as the cognitive stage.
 
-        db_path = out_dir / "db" / f"conv_{ci}"
-        log.info("[LoCoMo] conv %d: building memory (%s / %s) -> %s",
-                 ci, conv.get("speaker_a"), conv.get("speaker_b"), db_path)
-        t_build = time.time()
-        system = None
-        build_error = ""
-        try:
-            system = build_system(SystemCls, db_path, clear=True)
-            gen = build_locomo_turns(conv)
-            n_turns = 0
-            for speaker, text, dt in gen:
-                system.add_dialogue(speaker, text, iso(dt))
-                n_turns += 1
-            system.finalize()
-            failed_windows = getattr(system.memory_builder, "failed_windows", 0)
-            if failed_windows:
-                raise RuntimeError(
-                    f"memory extraction failed for {failed_windows} window(s)")
-            log.info("[LoCoMo] conv %d: memory built in %.1fs from %d turns",
-                     ci, time.time() - t_build, n_turns)
-        except Exception as exc:
-            build_error = str(exc)
-            log.exception("[LoCoMo] conv %d: memory build failed", ci)
+    Records are persisted PER QUESTION (under write_lock) instead of once per
+    conversation: a conversation takes hours, so batch-at-the-end writing would
+    lose every in-flight conversation on any interruption. Per-question writes
+    plus --resume make the run restartable at any moment with at most one
+    in-generation question lost per worker.
 
-        if build_error:
-            # Every QA of this conversation is invalid: record errors so they
-            # are excluded from metrics instead of answered from partial memory.
-            if system is not None:
-                release_system(system)
-            err_rows = []
-            for qi, qa in qa_rows:
-                sid = f"locomo-{ci}-qa-{qi}"
-                if sid in done_ids:
-                    continue
-                err_rows.append({
-                    "sample_id": sid,
-                    "source": "locomo",
-                    "conversation_id": ci,
-                    "question_input": qa.get("question", ""),
-                    "evidence": locomo_evidence_text(conv, qa.get("evidence") or []),
-                    "category": LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}'),
-                    "ground_truth": "" if qa.get("answer") is None else str(qa["answer"]),
-                    "prediction": f"[ERROR] {build_error}",
-                    "model": args.run_model,
-                    "elapsed_sec": 0.0,
-                    "error": build_error,
-                })
-                done_ids.add(sid)
-            append_jsonl(predictions_path, err_rows)
-            log.error("[LoCoMo] conv %d: wrote %d error records (memory build failed)",
-                      ci, len(err_rows))
-            continue
+    Returns (ci, n_rows). Never raises: build/ask errors are captured into
+    each record's "error" field so one bad conversation cannot kill the batch.
+    """
+    conv = item["conversation"]
+    db_path = out_dir / "db" / f"conv_{ci}"
+    n_rows = 0
+    log.info("[LoCoMo] conv %d: building memory (%s / %s) -> %s",
+             ci, conv.get("speaker_a"), conv.get("speaker_b"), db_path)
+    t_build = time.time()
+    system = None
+    build_error = ""
+    try:
+        system = build_system(SystemCls, db_path, clear=True)
+        gen = build_locomo_turns(conv)
+        n_turns = 0
+        for speaker, text, dt in gen:
+            system.add_dialogue(speaker, text, iso(dt))
+            n_turns += 1
+        system.finalize()
+        failed_windows = getattr(system.memory_builder, "failed_windows", 0)
+        if failed_windows:
+            raise RuntimeError(
+                f"memory extraction failed for {failed_windows} window(s)")
+        log.info("[LoCoMo] conv %d: memory built in %.1fs from %d turns",
+                 ci, time.time() - t_build, n_turns)
+    except Exception as exc:
+        build_error = str(exc)
+        log.exception("[LoCoMo] conv %d: memory build failed", ci)
 
-        new_rows = []
-        t_ask = time.time()
+    if build_error:
+        # Every QA of this conversation is invalid: record errors so they
+        # are excluded from metrics instead of answered from partial memory.
+        if system is not None:
+            release_system(system)
         for qi, qa in qa_rows:
             sid = f"locomo-{ci}-qa-{qi}"
             if sid in done_ids:
                 continue
-            category = LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}')
-            question = qa.get("question", "")
-            t0 = time.time()
-            error = ""
-            try:
-                prediction = system.ask(question)
-            except Exception as exc:
-                error = str(exc)
-                prediction = f"[ERROR] {exc}"
-                log.exception("[LoCoMo] ask failed | %s | Q=%s", sid, question[:150])
-            record = {
+            row = {
                 "sample_id": sid,
                 "source": "locomo",
                 "conversation_id": ci,
-                "question_input": question,
+                "question_input": qa.get("question", ""),
                 "evidence": locomo_evidence_text(conv, qa.get("evidence") or []),
-                "category": category,
+                "category": LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}'),
                 "ground_truth": "" if qa.get("answer") is None else str(qa["answer"]),
-                "prediction": prediction,
+                "prediction": f"[ERROR] {build_error}",
                 "model": args.run_model,
-                "elapsed_sec": round(time.time() - t0, 2),
-                "error": error,
+                "elapsed_sec": 0.0,
+                "error": build_error,
             }
-            new_rows.append(record)
+            with write_lock:
+                append_jsonl(predictions_path, [row])
+                done_ids.add(sid)
+            n_rows += 1
+        log.error("[LoCoMo] conv %d: %d error records (memory build failed)",
+                  ci, n_rows)
+        return ci, n_rows
+
+    t_ask = time.time()
+    n_qa = len(qa_rows)
+    for q_idx, qa in enumerate(qa_rows, start=1):
+        sid = f"locomo-{ci}-qa-{qi}"
+        if sid in done_ids:
+            continue
+        category = LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}')
+        question = qa.get("question", "")
+        t0 = time.time()
+        error = ""
+        try:
+            prediction = system.ask(question)
+        except Exception as exc:
+            error = str(exc)
+            prediction = f"[ERROR] {exc}"
+            log.exception("[LoCoMo] ask failed | %s | Q=%s", sid, question[:150])
+        row = {
+            "sample_id": sid,
+            "source": "locomo",
+            "conversation_id": ci,
+            "question_input": question,
+            "evidence": locomo_evidence_text(conv, qa.get("evidence") or []),
+            "category": category,
+            "ground_truth": "" if qa.get("answer") is None else str(qa["answer"]),
+            "prediction": prediction,
+            "model": args.run_model,
+            "elapsed_sec": round(time.time() - t0, 2),
+            "error": error,
+        }
+        with write_lock:
+            append_jsonl(predictions_path, [row])
             done_ids.add(sid)
-        append_jsonl(predictions_path, new_rows)
-        log.info("[LoCoMo] conv %d: wrote %d new predictions in %.1fs",
-                 ci, len(new_rows), time.time() - t_ask)
-        release_system(system)
+        n_rows += 1
+        if q_idx % 20 == 0 or q_idx == n_qa:
+            log.info("[LoCoMo] conv %d: %d/%d QA answered (%.0fs elapsed)",
+                     ci, q_idx, n_qa, time.time() - t_ask)
+    log.info("[LoCoMo] conv %d: finished %d QA in %.1fs",
+             ci, n_rows, time.time() - t_ask)
+    release_system(system)
+    return ci, n_rows
+
+
+def run_locomo(args, locomo_data, out_dir, done_ids, predictions_path):
+    SystemCls = load_simplemem_system_cls()
+    n_conv = len(locomo_data) if not args.limit_conv else min(args.limit_conv, len(locomo_data))
+    # Resolve the deterministic QA plan per conversation up front (seed + ci),
+    # then the pending list - exactly like the cognitive path - so the shared
+    # resume set / output file are only mutated under write_lock.
+    conv_plan = []
+    for ci in range(n_conv):
+        item = locomo_data[ci]
+        qa_rows = sample_qa(item.get("qa") or [], args.qa_per_category, args.seed + ci)
+        expected_ids = {f"locomo-{ci}-qa-{qi}" for qi, _ in qa_rows}
+        conv_plan.append((ci, item, qa_rows, expected_ids))
+    pending = [p for p in conv_plan
+               if not (args.resume and p[3] and p[3] <= done_ids)]
+    pending_ci = {p[0] for p in pending}
+    skipped = [ci for ci in range(n_conv) if ci not in pending_ci]
+    workers = max(1, args.locomo_concurrency)
+    total_qa = sum(len(p[2]) for p in pending)
+    log.info("[LoCoMo] evaluating %d conversations (%d pending, %d skipped by "
+             "resume, %d QA to answer, %d concurrent workers, independent "
+             "memory store each)",
+             n_conv, len(pending), len(skipped), total_qa, workers)
+    if skipped:
+        log.info("[LoCoMo] resume: skipping conversations %s (all predictions exist)",
+                 skipped)
+    write_lock = threading.Lock()
+    n_written = 0
+    t_stage = time.time()
+
+    def _consume(ci, n_rows):
+        # Stats + progress log only; records are persisted by the workers
+        # themselves (per question, under write_lock) so nothing is lost on
+        # interruption.
+        nonlocal n_written
+        n_written += n_rows
+        elapsed = time.time() - t_stage
+        with write_lock:
+            done_now = len(done_ids)
+        rate = done_now / elapsed * 60 if elapsed > 0 else 0.0
+        log.info("[LoCoMo] conv %d done: %d QA this conv, %d QA persisted so "
+                 "far (%.0fs elapsed, %.2f QA/min)",
+                 ci, n_rows, done_now, elapsed, rate)
+
+    if workers == 1:
+        # Keep the original deterministic serial path for --locomo-concurrency 1.
+        for ci, item, qa_rows, _ in pending:
+            _consume(*run_one_locomo_conversation(
+                ci, args, item, qa_rows, out_dir, SystemCls, done_ids,
+                write_lock, predictions_path))
+    else:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = [pool.submit(run_one_locomo_conversation, ci, args, item,
+                               qa_rows, out_dir, SystemCls, done_ids,
+                               write_lock, predictions_path)
+                   for ci, item, qa_rows, _ in pending]
+        try:
+            for fut in as_completed(futures):
+                _consume(*fut.result())
+        except KeyboardInterrupt:
+            # Persisted records stay valid; --resume skips them on restart.
+            log.warning("[LoCoMo] interrupted; cancelling queued work "
+                        "(in-flight questions are left to finish and persist).")
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
+
+    log.info("[LoCoMo] stage finished: %d QA persisted this run, %.1fs total",
+             n_written, time.time() - t_stage)
 
 
 def run_one_cognitive_sample(pi, args, plus_data, locomo_data, out_dir, SystemCls):
@@ -889,6 +973,14 @@ def main():
                         help="Use only the first N LoCoMo conversations (0 = all 10)")
     parser.add_argument("--qa-per-category", type=int, default=0,
                         help="Per conversation, sample at most N QA per category (0 = all)")
+    parser.add_argument("--locomo-concurrency", type=int, default=10,
+                        help="Number of LoCoMo conversations processed concurrently; each "
+                             "builds an independent memory store (db/conv_<ci>) and is "
+                             "answered by its own system instance, so workers never share "
+                             "mutable state. Practical max = number of conversations (10). "
+                             "The process-wide rate limiter paces ALL workers together, so "
+                             "raising this cannot cause 429 - it only stops the model quota "
+                             "from idling. 1 restores serial mode")
     parser.add_argument("--cognitive-limit", type=int, default=None,
                         help="Evaluate only the first N LoCoMo-Plus samples (default all 401)")
     parser.add_argument("--cognitive-concurrency", type=int, default=4,
