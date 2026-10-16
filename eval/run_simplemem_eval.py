@@ -65,13 +65,22 @@ from eval_logging import setup_run_logging  # noqa: E402
 
 log = logging.getLogger("eval")
 
-# Category id -> name. Verified against the data itself and the LoCoMo paper:
-# 1 single-hop (282), 2 temporal (321), 3 multi-hop (96),
+# Category id -> name. Authoritative source: LoCoMo paper (Maharana et al.,
+# ACL 2024, arXiv:2402.17753) Section 4.1, which numbers the five categories
+# explicitly: "(1) Single-hop ... (2) Multi-hop ... (3) Temporal reasoning ...
+# (4) Open-domain knowledge ... (5) Adversarial". Counts in locomo10.json:
+# 1 single-hop (282), 2 multi-hop (321), 3 temporal (96),
 # 4 open-domain (841), 5 adversarial (446, gold answer almost always empty).
+# NOTE: cat 2 contains the "When did / How long ago" questions and cat 3 the
+# "Would X ..." hypotheticals, which LOOKS like temporal/multi-hop respectively
+# - but the paper's numbering is authoritative (the official repo's
+# task_eval/evaluation_stats.py aggregates by raw id and never maps names).
+# An earlier revision of this dict had 2<->3 swapped based on question wording;
+# fixed 2026-10-16 after verifying the paper text.
 LOCOMO_CATEGORY = {
     1: "single-hop",
-    2: "temporal",
-    3: "multi-hop",
+    2: "multi-hop",
+    3: "temporal",
     4: "open-domain",
     5: "adversarial",
 }
