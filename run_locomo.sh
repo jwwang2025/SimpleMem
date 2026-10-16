@@ -2,8 +2,15 @@
 # Detached Launcher: SimpleMem on LoCoMo-10 (original 5-category QA).
 # 10 conversations / 1,986 questions:
 #   1 single-hop(282)  2 multi-hop(321)  3 temporal(96)
-#   4 open-domain(841) 5 adversarial(446, gold answer almost always empty,
-#   judged by the "Skeptical Judge" robustness prompt)
+#   4 open-domain(841) 5 adversarial(446) - category 5 runs the PAPER
+#   protocol (--adversarial-mode paper, the default): reference is the fixed
+#   string "Not mentioned in the conversation", retrieval with reflection
+#   disabled, forced binary-choice generation (refusal vs the dataset's
+#   adversarial_answer) at temperature 0.5, generic Relevance & Accuracy
+#   judge rubric. Mirrors the SimpleMem paper's reference implementation
+#   (test_locomo10.py) so our category-5 numbers are protocol-compatible.
+#   (--adversarial-mode open restores the legacy open-ended + Skeptical
+#   Judge behaviour; the two are NOT comparable to each other.)
 # LoCoMo-Plus cognitive is skipped (--skip-cognitive) so this experiment is
 # fully isolated from the LoCoMo-Plus run:
 #   - separate out-dir => separate predictions.jsonl / judged.jsonl /
@@ -55,6 +62,7 @@ fi
 
 setsid nohup python eval/run_simplemem_eval.py \
   --skip-cognitive --resume ${EXTRA_ARGS} \
+  --adversarial-mode paper \
   --locomo-concurrency ${LOCOMO_CONCURRENCY:-10} \
   --judge-model Qwen/Qwen3-8B --judge-concurrency 8 --run-model Qwen/Qwen3-8B \
   --out-dir eval_output/locomo_v1 --run-tag locomo_v1 --strict \

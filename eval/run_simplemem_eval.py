@@ -96,6 +96,135 @@ JUDGE_TEMPLATE_KEY = {
     "Cognitive": "Cognitive",
 }
 
+# ---------------------------------------------------------------------------
+# Adversarial (LoCoMo category 5) handling
+# ---------------------------------------------------------------------------
+# Two protocols, selected with --adversarial-mode:
+#
+# "paper" (default) mirrors the reference implementation of the SimpleMem
+# paper (arXiv:2601.02553), test_locomo10.py:generate_category5_answer, so
+# our category-5 numbers are protocol-compatible with theirs:
+#   * the reference answer is the FIXED string "Not mentioned in the
+#     conversation" - never the (almost always empty) gold answer and never
+#     the dataset's plausible-but-unspoken "adversarial_answer";
+#   * retrieval runs with reflection DISABLED ("no answer means no answer");
+#   * generation is a forced binary choice between that fixed string and the
+#     dataset's adversarial_answer (option order randomly shuffled), JSON
+#     output, temperature 0.5, up to 3 attempts, refusal-string fallback;
+#   * scoring uses the ordinary metric suite against the fixed string, and
+#     the judge is the paper's generic Relevance & Accuracy rubric
+#     ("adversarial-paper" below), NOT the skeptical rubric.
+#
+# "open" is the pre-2026-10-16 behaviour: open-ended generation judged by the
+# Skeptical Judge against the (almost always empty) gold answer. Kept so the
+# two protocols can be A/B-compared on the same questions.
+ADVERSARIAL_REFUSAL = "Not mentioned in the conversation"
+ADVERSARIAL_PAPER_PROTOCOL = "paper-cat5"
+ADVERSARIAL_OPEN_PROTOCOL = "open-skeptical"
+
+# Structure of the paper's category-5 prompt (test_locomo10.py, verbatim).
+CATEGORY5_CHOICE_PROMPT = """Based on the context below, answer the following question.
+
+Context:
+{context_str}
+
+Question: {question}
+
+Select the correct answer from the following two options. If the given answer is wrong or not answerable based on the context, you should choose "Not mentioned in the conversation".
+
+Option A: {option_a}
+Option B: {option_b}
+
+Requirements:
+1. Choose the option that best matches the context
+2. If neither answer is supported by the context, or if the provided specific answer is incorrect, choose "Not mentioned in the conversation"
+3. Return your response in JSON format
+
+Output Format:
+```json
+{{
+  "reasoning": "Brief explanation of your choice",
+  "answer": "Your selected answer (either '{option_a}' or '{option_b}')"
+}}
+```
+
+Return ONLY the JSON, no other text.
+"""
+
+
+def adversarial_protocol_tag(args, qa) -> str:
+    """Protocol tag stored on every LoCoMo row ("" for non-adversarial QA).
+
+    A prediction is only valid under the protocol that produced it, so the
+    tag travels with the row: it drives judge routing and makes stale rows
+    auditable after a protocol switch.
+    """
+    if LOCOMO_CATEGORY.get(qa.get("category")) != "adversarial":
+        return ""
+    if getattr(args, "adversarial_mode", "paper") == "paper":
+        return ADVERSARIAL_PAPER_PROTOCOL
+    return ADVERSARIAL_OPEN_PROTOCOL
+
+
+def locomo_row_gold(args, qa) -> str:
+    """Reference answer recorded for a QA row under the active mode.
+
+    Paper mode: the fixed refusal string for every category-5 question
+    (mirrors test_locomo10.py, where the cat-5 ground truth is hardcoded).
+    Open mode: the raw dataset answer (empty for 444/446 category-5 QA).
+    """
+    if adversarial_protocol_tag(args, qa) == ADVERSARIAL_PAPER_PROTOCOL:
+        return ADVERSARIAL_REFUSAL
+    return "" if qa.get("answer") is None else str(qa["answer"])
+
+
+def cat5_distractor(qa) -> str:
+    """The binary-choice distractor for a category-5 QA (paper protocol)."""
+    return str(qa.get("adversarial_answer") or "").strip() or "Unknown answer"
+
+
+def answer_locomo_adversarial_paper(system, question: str, adversarial_answer) -> str:
+    """Category-5 generation under the paper protocol.
+
+    Faithful re-implementation of test_locomo10.py
+    (SimpleMemTester.generate_category5_answer): reflection-free retrieval,
+    forced binary choice between the fixed refusal string and the dataset's
+    adversarial_answer (shuffled), JSON output at temperature 0.5, three
+    attempts, refusal-string fallback. Retrieval errors propagate to the
+    caller (recorded as an error row and retried on --resume); generation
+    failures fall back exactly like the paper. Only deviation: an empty
+    "answer" field is retried instead of being returned as an empty string.
+    """
+    distractor = str(adversarial_answer or "").strip() or "Unknown answer"
+    contexts = system.hybrid_retriever.retrieve(question, enable_reflection=False)
+    context_str = system.answer_generator._format_contexts(contexts)
+    options = [ADVERSARIAL_REFUSAL, distractor]
+    if random.random() < 0.5:
+        options.reverse()
+    prompt = CATEGORY5_CHOICE_PROMPT.format(
+        context_str=context_str,
+        question=question,
+        option_a=options[0],
+        option_b=options[1],
+    )
+    messages = [
+        {"role": "system",
+         "content": "You are a professional Q&A assistant. You must output valid JSON format."},
+        {"role": "user", "content": prompt},
+    ]
+    for attempt in range(3):
+        try:
+            response = system.llm_client.chat_completion(
+                messages, temperature=0.5, max_retries=3)
+            result = system.llm_client.extract_json(response)
+            answer = str(result.get("answer", response.strip())).strip()
+            if answer:
+                return answer
+        except Exception as exc:
+            log.warning("[LoCoMo] cat5 paper attempt %d/3 failed | Q=%s | %s",
+                        attempt + 1, question[:120], exc)
+    return ADVERSARIAL_REFUSAL
+
 # Judge rubrics adapted from
 # https://github.com/xjtuleeyf/Locomo-Plus/blob/main/evaluation_framework/task_eval/prompt.py
 JUDGE_TEMPLATES = {
@@ -188,6 +317,30 @@ Labels:
 
 Model Prediction:
 {pred}
+
+Return strictly in JSON:
+{{"label": "correct"|"wrong", "reason": "<short explanation>"}}
+""",
+    "adversarial-paper": """You are an expert Relevance & Accuracy Evaluator. Your task is to determine if the Predicted Answer successfully retrieves the necessary information to answer the Question, based on the Reference Answer.
+
+Question: {question}
+
+Reference Answer:
+{gold}
+
+Predicted Answer:
+{pred}
+
+Evaluation Criteria:
+
+1. Responsiveness to Query: The predicted answer must directly address the specific question asked. It must contain highly relevant information that is topically aligned with the user's intent.
+2. Core Fact Preservation: The prediction must capture the "Key Signal" or "Core Entity" from the reference. The primary subject (Who), event (What), or outcome must be factually grounded in the reference text.
+3. Informational Utility: The answer must provide actionable or meaningful value. Even if brief, it must convey the essential message required by the question context.
+4. Acceptable Representational Variances (Robustness Protocol): accept the following variations as valid matches: timestamps within a reasonable proximity and rounded numerical approximations; different granularity ("Afternoon" vs "14:05"); a valid subset of the reference; domain-specific synonyms and different formats.
+
+Grading Logic:
+- "correct" (score 1.0): The prediction contains relevant core information, answers the question with sufficient utility, OR falls within the acceptable representational variances defined in criterion 4.
+- "wrong" (score 0.0): The prediction contains NO relevant information, fails to identify the core subject/event, or provides no key info that matches the question's intent.
 
 Return strictly in JSON:
 {{"label": "correct"|"wrong", "reason": "<short explanation>"}}
@@ -444,6 +597,7 @@ def run_one_locomo_conversation(ci, args, item, qa_rows, out_dir, SystemCls,
             sid = f"locomo-{ci}-qa-{qi}"
             if sid in done_ids:
                 continue
+            err_protocol = adversarial_protocol_tag(args, qa)
             row = {
                 "sample_id": sid,
                 "source": "locomo",
@@ -451,7 +605,10 @@ def run_one_locomo_conversation(ci, args, item, qa_rows, out_dir, SystemCls,
                 "question_input": qa.get("question", ""),
                 "evidence": locomo_evidence_text(conv, qa.get("evidence") or []),
                 "category": LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}'),
-                "ground_truth": "" if qa.get("answer") is None else str(qa["answer"]),
+                "protocol": err_protocol,
+                "adversarial_answer": (cat5_distractor(qa)
+                                       if err_protocol == ADVERSARIAL_PAPER_PROTOCOL else ""),
+                "ground_truth": locomo_row_gold(args, qa),
                 "prediction": f"[ERROR] {build_error}",
                 "model": args.run_model,
                 "elapsed_sec": 0.0,
@@ -473,14 +630,29 @@ def run_one_locomo_conversation(ci, args, item, qa_rows, out_dir, SystemCls,
             continue
         category = LOCOMO_CATEGORY.get(qa.get("category"), f'category_{qa.get("category")}')
         question = qa.get("question", "")
+        protocol = adversarial_protocol_tag(args, qa)
         t0 = time.time()
         error = ""
-        try:
-            prediction = system.ask(question)
-        except Exception as exc:
-            error = str(exc)
-            prediction = f"[ERROR] {exc}"
-            log.exception("[LoCoMo] ask failed | %s | Q=%s", sid, question[:150])
+        gold = locomo_row_gold(args, qa)
+        prediction = ""
+        if protocol == ADVERSARIAL_PAPER_PROTOCOL:
+            # Paper protocol for category 5: fixed refusal reference,
+            # reflection-free retrieval, forced binary choice.
+            try:
+                prediction = answer_locomo_adversarial_paper(
+                    system, question, qa.get("adversarial_answer"))
+            except Exception as exc:
+                error = str(exc)
+                prediction = f"[ERROR] {exc}"
+                log.exception("[LoCoMo] cat5 (paper) failed | %s | Q=%s",
+                              sid, question[:150])
+        else:
+            try:
+                prediction = system.ask(question)
+            except Exception as exc:
+                error = str(exc)
+                prediction = f"[ERROR] {exc}"
+                log.exception("[LoCoMo] ask failed | %s | Q=%s", sid, question[:150])
         row = {
             "sample_id": sid,
             "source": "locomo",
@@ -488,7 +660,10 @@ def run_one_locomo_conversation(ci, args, item, qa_rows, out_dir, SystemCls,
             "question_input": question,
             "evidence": locomo_evidence_text(conv, qa.get("evidence") or []),
             "category": category,
-            "ground_truth": "" if qa.get("answer") is None else str(qa["answer"]),
+            "protocol": protocol,
+            "adversarial_answer": (cat5_distractor(qa)
+                                   if protocol == ADVERSARIAL_PAPER_PROTOCOL else ""),
+            "ground_truth": gold,
             "prediction": prediction,
             "model": args.run_model,
             "elapsed_sec": round(time.time() - t0, 2),
@@ -755,6 +930,20 @@ def parse_judge_response(raw: str):
     return label, reason
 
 
+def judge_template_key(record) -> str:
+    """Judge rubric for a prediction row.
+
+    Category-5 rows generated under the paper protocol are scored with the
+    paper's generic Relevance & Accuracy rubric against the fixed refusal
+    reference (mirrors test_locomo10.py:llm_judge_answers); every other row
+    (including legacy open-mode adversarial rows) keeps its category rubric.
+    """
+    cat = record.get("category") or "unknown"
+    if cat == "adversarial" and record.get("protocol") == ADVERSARIAL_PAPER_PROTOCOL:
+        return "adversarial-paper"
+    return JUDGE_TEMPLATE_KEY.get(cat)
+
+
 def run_judge(args, predictions, judged_path, done_judged):
     from openai import OpenAI
     from simplemem.core.settings import settings
@@ -799,8 +988,7 @@ def run_judge(args, predictions, judged_path, done_judged):
     judge_jitter = float(getattr(settings, "LLM_RETRY_JITTER", 1.0))
 
     def judge_one(record):
-        cat = record.get("category") or "unknown"
-        template_key = JUDGE_TEMPLATE_KEY.get(cat)
+        template_key = judge_template_key(record)
         template = JUDGE_TEMPLATES.get(template_key)
         if template is None:
             return record, "", "no template", 0.0
@@ -808,6 +996,7 @@ def run_judge(args, predictions, judged_path, done_judged):
             gold=str(record.get("ground_truth") or ""),
             pred=str(record.get("prediction") or ""),
             evidence=str(record.get("evidence") or ""),
+            question=str(record.get("question_input") or ""),
         )
         raw = ""
         for attempt in range(judge_max_retries):
@@ -1012,6 +1201,17 @@ def main():
     parser.add_argument("--skip-cognitive", action="store_true")
     parser.add_argument("--skip-locomo", action="store_true",
                         help="Skip original LoCoMo 5-category QA (run Cognitive only)")
+    parser.add_argument("--adversarial-mode", choices=["paper", "open"],
+                        default="paper",
+                        help="Protocol for LoCoMo category 5 (adversarial / "
+                             "unanswerable) questions. 'paper' (default) mirrors "
+                             "the reference implementation of the SimpleMem paper "
+                             "(arXiv:2601.02553, test_locomo10.py): fixed 'Not "
+                             "mentioned in the conversation' reference, "
+                             "reflection-free retrieval, forced binary-choice "
+                             "generation at temperature 0.5, generic judge "
+                             "rubric. 'open' is the legacy open-ended generation "
+                             "+ Skeptical Judge behaviour")
     parser.add_argument("--skip-judge", action="store_true")
     parser.add_argument("--judge-model", default="", help="Default: same LLM_MODEL as the system")
     parser.add_argument("--judge-concurrency", type=int, default=8)
