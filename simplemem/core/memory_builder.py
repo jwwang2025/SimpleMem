@@ -19,6 +19,71 @@ import threading
 from functools import partial
 
 
+def _salvage_entry_objects(text: str) -> list:
+    """Scan raw LLM output for every complete memory-entry object.
+
+    A truncated extraction response looks like::
+
+        ```json
+        [
+          {"lossless_restatement": "...", ...},
+          {"lossless_restatement": "...", ...},
+          {"lossless_restatement": "...", ...   <-- cut off here
+
+    ``extract_json`` cannot parse that (no closing fence/bracket) and its
+    balanced-JSON fallback probes ``{`` before ``[``, returning only the first
+    entry as a dict. This helper walks the text with proper string/escape
+    tracking and returns every maximal balanced ``{...}`` group that parses as
+    a dict carrying a string ``lossless_restatement`` - i.e. every INTACT
+    entry, dropping only the truncated tail. Returns [] when nothing intact
+    is found.
+    """
+    if not text:
+        return []
+    entries = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_string = False
+        escape = False
+        end = -1
+        for j in range(i, n):
+            ch = text[j]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end == -1:
+            break  # unbalanced tail (truncated) - nothing complete remains
+        try:
+            obj = json.loads(text[i:end + 1])
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("lossless_restatement"), str):
+            entries.append(obj)
+            i = end + 1  # a real entry: skip the whole object
+        else:
+            i += 1  # not an entry (e.g. a {"memories": [...]} wrapper): look inside
+    return entries
+
+
 class MemoryBuilder:
     """
     Memory Builder - Semantic Structured Compression (Section 3.1)
@@ -333,6 +398,34 @@ Now process the above dialogues. Return ONLY the JSON array, no other explanatio
         """
         # Extract JSON
         data = self.llm_client.extract_json(response)
+
+        if isinstance(data, dict):
+            # Two legitimate shapes land here:
+            #  1. the model wrapped the array in an object, e.g. {"memories": [...]}
+            #  2. the response was TRUNCATED mid-array (context length): the
+            #     ```json fence never closes, so extract_json's balanced-JSON
+            #     fallback (which probes '{' before '[') returns the FIRST
+            #     complete entry object as a dict. Dense windows hit this
+            #     deterministically - 10 identical retries cannot fix a
+            #     truncation (observed 3/3 windows on 2026-10-19 with local
+            #     vLLM Qwen3-8B; the SiliconFlow backend rarely truncated).
+            # Salvage every complete entry object from the raw response so a
+            # truncated window still contributes its intact entries instead of
+            # failing the whole conversation (which excludes ALL its QA from
+            # the metrics). Successful (untruncated) responses never reach
+            # this branch - extract_json returns the list directly.
+            salvaged = _salvage_entry_objects(response)
+            if salvaged:
+                print(f"Salvaged {len(salvaged)} complete entries from a "
+                      f"truncated/wrapped extraction response")
+                data = salvaged
+            else:
+                for value in data.values():
+                    if isinstance(value, list) and value:
+                        data = value
+                        break
+                else:
+                    raise ValueError(f"Expected JSON array but got: {type(data)}")
 
         if not isinstance(data, list):
             raise ValueError(f"Expected JSON array but got: {type(data)}")
