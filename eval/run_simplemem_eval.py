@@ -78,10 +78,19 @@ log = logging.getLogger("eval")
 # An earlier revision of this dict had 2<->3 swapped based on question wording;
 # fixed 2026-10-16 after verifying the paper text.
 LOCOMO_CATEGORY = {
-    1: "single-hop",
-    2: "multi-hop",
-    3: "temporal",
-    4: "open-domain",
+    # Mapping verified against the dataset content in locomo10.json (2026-10-19):
+    # cat 1 evidence spans ~2.8 sessions on average (aggregation questions like
+    # "What activities does Melanie partake in?") -> multi-hop; cat 2 is all
+    # "When did ..." -> temporal; cat 3 is "Would X ..." hypotheticals ->
+    # open-domain; cat 4 is 94.5% single-session lookups -> single-hop.
+    # This matches the SimpleMem paper's Section 3.1 numbering (and its Table 3
+    # column headers). NOTE: LoCoMo's own paper Section 4.1 numbers the same
+    # file differently (1=single-hop, 2=multi-hop, 3=temporal, 4=open-domain) -
+    # do not use that numbering for this file.
+    1: "multi-hop",
+    2: "temporal",
+    3: "open-domain",
+    4: "single-hop",
     5: "adversarial",
 }
 COGNITIVE = "Cognitive"

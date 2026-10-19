@@ -1,8 +1,9 @@
 #!/bin/bash
 # Detached Launcher: SimpleMem on LoCoMo-10 (original 5-category QA).
-# 10 conversations / 1,986 questions:
-#   1 single-hop(282)  2 multi-hop(321)  3 temporal(96)
-#   4 open-domain(841) 5 adversarial(446) - category 5 runs the PAPER
+# 10 conversations / 1,986 questions. Category numbering verified against the
+# dataset content (2026-10-19, evidence-span analysis):
+#   1 multi-hop(282)  2 temporal(321)  3 open-domain(96)
+#   4 single-hop(841) 5 adversarial(446) - category 5 runs the PAPER
 #   protocol (--adversarial-mode paper, the default): reference is the fixed
 #   string "Not mentioned in the conversation", retrieval with reflection
 #   disabled, forced binary-choice generation (refusal vs the dataset's
