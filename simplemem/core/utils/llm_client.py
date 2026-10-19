@@ -128,6 +128,10 @@ _global_limiter: Optional["RateLimiter"] = None
 _global_limiter_lock = threading.Lock()
 _call_stats = {"calls": 0, "rejected_429": 0}
 _call_stats_lock = threading.Lock()
+# Real token usage per chat call, accumulated from response.usage (prompt /
+# completion / total). Purely additive bookkeeping for token-cost reporting
+# (paper Table "Token Cost" = average tokens per query); no behaviour change.
+_usage_stats = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 # EWMA of actual/estimated tokens per call, calibrated from real response
 # usage: the static estimate under-counted Qwen3's output ~1.5x in the first
 # v3 hours, which silently doubled the offered TPM. Starts at 1.0 and
@@ -180,6 +184,18 @@ def get_llm_stats() -> Dict[str, int]:
         return dict(_call_stats)
 
 
+def get_usage_stats() -> Dict[str, int]:
+    """Accumulated real token usage across all chat calls in this process."""
+    with _call_stats_lock:
+        return dict(_usage_stats)
+
+
+def reset_usage_stats() -> None:
+    with _call_stats_lock:
+        for k in _usage_stats:
+            _usage_stats[k] = 0
+
+
 def _est_ratio_snapshot() -> float:
     with _est_ratio_lock:
         return _est_ratio
@@ -189,12 +205,24 @@ def _note_actual_usage(response, est: float):
     """Calibrate the estimate against real token usage (EWMA, alpha=0.1).
     Closes the loop between what we THROTTLE on and what the server METERS:
     without this, a systematically under-counted output silently doubles the
-    offered TPM (exactly what produced 252 x 429 in the first v3 hours)."""
+    offered TPM (exactly what produced 252 x 429 in the first v3 hours).
+    Also accumulates per-call token usage for cost reporting."""
     global _est_ratio
     usage = getattr(response, "usage", None)
-    if usage is None or est <= 0:
+    if usage is None:
         return
-    actual = float(getattr(usage, "total_tokens", 0) or 0)
+    pt = int(getattr(usage, "prompt_tokens", 0) or 0)
+    ct = int(getattr(usage, "completion_tokens", 0) or 0)
+    tt = int(getattr(usage, "total_tokens", 0) or 0)
+    if pt or ct or tt:
+        with _call_stats_lock:
+            _usage_stats["calls"] += 1
+            _usage_stats["prompt_tokens"] += pt
+            _usage_stats["completion_tokens"] += ct
+            _usage_stats["total_tokens"] += tt or (pt + ct)
+    if est <= 0:
+        return
+    actual = float(tt or 0)
     if actual <= 0:
         return
     with _est_ratio_lock:
